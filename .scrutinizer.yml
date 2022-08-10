@@ -1,8 +1,9 @@
-before_commands:
-    - "pecl install openswoole"
 build:
   nodes:
     php74:
       environment:
         php: 7.4
         redis: false
+      dependencies:
+        before:
+          - command: 'pecl install openswoole'
