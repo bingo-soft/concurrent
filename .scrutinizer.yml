@@ -1,8 +1,5 @@
 before_commands:
-    - "apt install software-properties-common"
-    - "add-apt-repository ppa:ondrej/php"
-    - "apt-get update"
-    - "apt install php-swoole"
+    - "pecl install openswoole"
     - "composer install --no-interaction"
 build:
   nodes:
