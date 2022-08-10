@@ -13,7 +13,7 @@ Concurrent programming constructs for PHP
 Install library, using Composer:
 
 ```
-composer require bingo-soft/script
+composer require bingo-soft/concurrent
 ```
 
 # Example 1
