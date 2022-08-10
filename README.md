@@ -16,6 +16,22 @@ Install library, using Composer:
 composer require bingo-soft/script
 ```
 
+# Example 1
+
+```php
+$workQueue = new ArrayBlockingQueue(3);
+$pool = new ProcessPoolExecutor(3, 0, TimeUnit::SECONDS, $workQueue);
+$task1 = new TestTask("task 1");
+$task2 = new TestTask("task 2");
+$task3 = new TestTask("task 3");
+$task4 = new TestTask("task 4");
+
+$pool->execute($task1);
+$pool->execute($task2);
+$pool->execute($task3);
+$pool->execute($task4); //task for is waiting for an empty slot in the pool
+```
+
 # Running tests
 
 ```
