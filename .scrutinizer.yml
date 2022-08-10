@@ -1,0 +1,12 @@
+before_commands:
+    - "apt install software-properties-common"
+    - "add-apt-repository ppa:ondrej/php"
+    - "apt-get update"
+    - "apt install php-swoole"
+    - "composer install --no-interaction"
+build:
+  nodes:
+    php74:
+      environment:
+        php: 7.4
+        redis: false

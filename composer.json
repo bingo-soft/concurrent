@@ -1,0 +1,36 @@
+{  
+    "name": "bingo-soft/concurrent",
+    "license": "MIT",
+    "authors": [{
+        "name": "Bingo-Soft",
+        "email": "bingosoft@bk.ru"
+    }],
+    "description": "Concurrent programming constructs for PHP",
+    "keywords": ["php", "pool", "concurrent", "parallel", "worker"],
+    "homepage": "https://github.com/bingo-soft/concurrent",
+    "type": "project",
+    "config": {
+        "vendor-dir": "./vendor",
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    },
+    "require": {
+        "php": "^7.4 || ^8.0"
+    },
+    "require-dev": {
+        "doctrine/coding-standard": "*",
+        "squizlabs/php_codesniffer": "*",
+        "phpunit/phpunit": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Concurrent\\": "./src"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": { 
+            "Tests\\": "./tests"
+        }
+    }
+}
