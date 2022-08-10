@@ -1,6 +1,5 @@
 before_commands:
     - "pecl install openswoole"
-    - "composer install --no-interaction"
 build:
   nodes:
     php74:
