@@ -50,5 +50,6 @@ class TestTask implements RunnableInterface, \Serializable
             }
             $num += 1;
         }
+        file_put_contents("log.txt", sprintf("Task '%s' completed. Calculated prime number is %s\n", $this->name, $prime), FILE_APPEND);
     }
 }

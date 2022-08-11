@@ -40,6 +40,16 @@ $pool->shutdown(); //shutdown pool with all processes attached
 ./vendor/bin/phpunit ./tests
 ```
 
+# Running docker container with examples
+
+```
+cd example
+docker-compose build
+docker-compose up
+```
+
+To test core usage, you can edit `TestTask` - change value `2000` in `run` method to `8000` and then run container again. When container is running check how cores are used - use `top` command, then press `f` and turn on `p` (Last used Cpu). You will see, that while container is running, different processor cores are used. 
+
 # Dependencies
 
 The library depends on [Swoole](https://openswoole.com/) extension

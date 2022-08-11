@@ -1,7 +1,6 @@
-FROM php:7.4-fpm
+FROM php:8.0-fpm
 
-ENV PHP_VERSION=7.4
-ENV PHALCON_VERSION=4.1.3
+ENV PHP_VERSION=8.0
 ENV TZ=Europe/Moscow
 
 
@@ -43,19 +42,7 @@ RUN git clone https://github.com/jbboehr/php-psr.git /root/psr && \
 RUN curl -sS https://getcomposer.org/installer | php \
     && mv composer.phar /usr/local/bin/composer
 
-# Get and install Phalcon
-RUN mkdir /root/buildphalcon && cd /root/buildphalcon && \
-    wget https://github.com/phalcon/cphalcon/archive/v${PHALCON_VERSION}.tar.gz && \
-    tar zxvf v${PHALCON_VERSION}.tar.gz && \
-    cd cphalcon-${PHALCON_VERSION}/build/php$(echo ${PHP_VERSION} | cut -d '.' -f 1)/64bits && \
-    phpize && export CFLAGS="-O2 -s" && \
-    ./configure && make -j 8 && make install && \
-    echo "extension=phalcon.so" > /usr/local/etc/php/conf.d/30-phalcon.ini && \
-    rm -Rf /root/buildphalcon
-
-RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-ENV SWOOLE_VERSION=4.6.0
+ENV SWOOLE_VERSION=5.0.0
 
 # Install Swoole
 RUN cd /tmp && wget https://pecl.php.net/get/swoole-${SWOOLE_VERSION}.tgz && \
@@ -70,6 +57,7 @@ RUN cd /tmp && wget https://pecl.php.net/get/swoole-${SWOOLE_VERSION}.tgz && \
 COPY composer.json /var/www/html/composer.json
 RUN cd /var/www/html/ && composer install --no-interaction
 COPY src /var/www/html/src
+RUN composer clear-cache
 RUN composer update --no-dev
 COPY php.ini /usr/local/etc/php/php.ini
 RUN cd /var/www/html/ && composer dump-autoload -o

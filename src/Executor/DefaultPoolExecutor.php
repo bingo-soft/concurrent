@@ -227,6 +227,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
                     $w->interrupt();
                 } catch (\Exception $ignore) {
                     //
+                    fwrite(STDERR, "Exception in interruptWorkers\n");
                 }
             }
         } finally {
@@ -429,8 +430,9 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
                     return unserialize($r);
                 }
                 $timedOut = true;
-            } catch (\Exception $retry) {
+            } catch (\Exception $e) {
                 $timedOut = false;
+                fwrite(STDERR, sprintf("Exception in getTask: %s\n", $e->getMessage()));
             }
         }
     }
@@ -455,6 +457,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
                             $queuedTask->run();
                         }
                     } catch (\Exception $x) {
+                        fwrite(STDERR, sprintf("Exception in runWorker: %s\n", $x->getMessage()));
                         $thrown = $x;
                         throw $x;
                     }
@@ -484,6 +487,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
         if (
             $poolSize <= 0 || $keepAliveTime < 0
         ) {
+            fwrite(STDERR, "Illegal argument exception in constructor\n");
             throw new \Exception("Illegal argument");
         }
         $this->poolSize = $poolSize;

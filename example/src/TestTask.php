@@ -1,6 +1,6 @@
 <?php
 
-namespace Example\Task;
+namespace Example;
 
 use Concurrent\RunnableInterface;
 
@@ -51,6 +51,6 @@ class TestTask implements RunnableInterface, \Serializable
             $num += 1;
         }
         fwrite(STDERR, sprintf("Task '%s' completed. Calculated prime number is %d\n", $this->name, $prime));
-        //file_put_contents("log.txt", sprintf("Task '%s' completed. Calculated prime number is %d\n", $this->name, $prime), FILE_APPEND);
+        //file_put_contents("log.txt", sprintf("Task '%s' completed. Calculated prime number is %s\n", $this->name, $prime), FILE_APPEND);
     }
 }
