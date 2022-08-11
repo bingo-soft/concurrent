@@ -1,11 +1,19 @@
 <?php
 
-namespace Concurrent;
+namespace Concurrent\Worker;
 
-class Worker extends \Swoole\Lock implements RunnableInterface
+use Concurrent\{
+    ExecutorServiceInterface,
+    RunnableInterface
+};
+
+class ProcessWorker extends \Swoole\Lock implements RunnableInterface
 {
-    /** Initial task to run.  Possibly null. */
     public $firstTask;
+
+    public $executor;
+
+    public $thread;
 
     /**
      * Creates with given first task.
@@ -17,15 +25,15 @@ class Worker extends \Swoole\Lock implements RunnableInterface
         $this->firstTask = $firstTask;
         $this->executor = $executor;
         $scope = $this;
-        $this->process = new InterruptibleProcess(function ($process) use ($scope) {
+        $this->thread = new InterruptibleProcess(function ($process) use ($scope) {
             $scope->run();
         }, false);
-        $this->process->useQueue(9999, 2);
+        $this->thread->useQueue(1, 2);
     }
 
     public function start(): void
     {
-        $this->process->start();
+        $this->thread->start();
     }
 
     /** Delegates main run loop to outer runWorker  */

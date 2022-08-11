@@ -1,8 +1,17 @@
 <?php
 
-namespace Concurrent;
+namespace Concurrent\Executor;
 
-class ProcessPoolExecutor implements ExecutorServiceInterface
+use Concurrent\{
+    ExecutorServiceInterface,
+    RunnableInterface,
+    ThreadInterface
+};
+use Concurrent\Time\TimeUnit;
+use Concurrent\Queue\ArrayBlockingQueue;
+use Concurrent\Worker\WorkerFactory;
+
+class DefaultPoolExecutor implements ExecutorServiceInterface
 {
     private $ctl;
     private const COUNT_BITS = ( PHP_INT_SIZE * 4 ) - 3;
@@ -18,6 +27,7 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
 
     private $workQueue;
     private $queueSize;
+    private $workerType;
 
     private $mainLock;
 
@@ -230,7 +240,7 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
         $mainLock->trylock();
         try {
             foreach ($this->workers as $w) {
-                $t = $w->process;
+                $t = $w->thread;
                 if (!$t->isInterrupted() && $w->trylock()) {
                     try {
                         $t->interrupt();
@@ -308,8 +318,8 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
             }
         }
 
-        $w = new Worker($firstTask, $this);
-        $t = $w->process;
+        $w = WorkerFactory::create($this->workerType, $firstTask, $this);
+        $t = $w->thread;
 
         $this->mainLock->trylock();
         try {
@@ -342,7 +352,7 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
         return true;
     }
 
-    private function processWorkerExit(Worker $w, bool $completedAbruptly): void
+    private function processWorkerExit(RunnableInterface $w, bool $completedAbruptly): void
     {
         if ($completedAbruptly) {// If abrupt, then workerCount wasn't adjusted
             $this->decrementWorkerCount();
@@ -377,7 +387,7 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
         }
     }
 
-    private function getTask(InterruptibleProcess $process): ?RunnableInterface
+    private function getTask(ThreadInterface $thread): ?RunnableInterface
     {
         $timedOut = false;
         for (;;) {
@@ -410,8 +420,8 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
             }
             try {
                 $r = $timed ?
-                    $this->workQueue->poll($this->keepAliveTime, TimeUnit::NANOSECONDS, $process) :
-                    $this->workQueue->take($process);
+                    $this->workQueue->poll($this->keepAliveTime, TimeUnit::NANOSECONDS, $thread) :
+                    $this->workQueue->take($thread);
                 if ($r !== null) {
                     return unserialize($r);
                 }
@@ -422,14 +432,14 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
         }
     }
 
-    public function runWorker(Worker $w): void
+    public function runWorker(RunnableInterface $w): void
     {
         $firstTask = $w->firstTask;
         $queuedTask = null;
         $w->firstTask = null;
         $completedAbruptly = true;
         try {
-            while ($firstTask !== null || ($queuedTask = $this->getTask($w->process)) !== null) {
+            while ($firstTask !== null || ($queuedTask = $this->getTask($w->thread)) !== null) {
                 $w->trylock();
                 try {
                     $thrown = null;
@@ -460,22 +470,23 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
 
     public function __construct(
         int $poolSize,
-        int $keepAliveTime,
-        string $unit,
-        BlockingQueueInterface $workQueue
+        int $keepAliveTime = 0,
+        string $unit = TimeUnit::MILLISECONDS,
+        BlockingQueueInterface $workQueue = null,
+        string $workerType = 'process'
     ) {
         $this->ctl = new \Swoole\Atomic\Long(self::ctlOf(self::RUNNING, 0));
         $this->mainLock = new \Swoole\Lock(SWOOLE_MUTEX);
         $this->queueSize = new \Swoole\Atomic\Long(0);
-
         if (
             $poolSize <= 0 || $keepAliveTime < 0
         ) {
             throw new \Exception("Illegal argument");
         }
         $this->poolSize = $poolSize;
-        $this->workQueue = $workQueue;
+        $this->workQueue = $workQueue ?? new ArrayBlockingQueue();
         $this->keepAliveTime = TimeUnit::toNanos($keepAliveTime, $unit);
+        $this->workerType = $workerType;
     }
 
     public function execute(RunnableInterface $command): void
@@ -488,7 +499,7 @@ class ProcessPoolExecutor implements ExecutorServiceInterface
             $c = $this->ctl->get();
         }
         if (self::isRunning($c)) {
-            $process = $this->workers[rand(0, count($this->workers) - 1)]->process;
+            $process = $this->workers[rand(0, count($this->workers) - 1)]->thread;
             if ($this->workQueue->offer($command, $process)) {
                 $this->compareAndIncrementQueueSize($this->workQueue->size() - 1);
                 $recheck = $this->ctl->get();

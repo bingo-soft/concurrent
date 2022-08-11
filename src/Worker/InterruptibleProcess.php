@@ -1,8 +1,10 @@
 <?php
 
-namespace Concurrent;
+namespace Concurrent\Worker;
 
-class InterruptibleProcess extends \Swoole\Process
+use Concurrent\ThreadInterface;
+
+class InterruptibleProcess extends \Swoole\Process implements ThreadInterface
 {
     private $interrupted = false;
 

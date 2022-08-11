@@ -1,6 +1,6 @@
 <?php
 
-namespace Concurrent;
+namespace Concurrent\Time;
 
 abstract class TimerTask implements RunnableInterface
 {

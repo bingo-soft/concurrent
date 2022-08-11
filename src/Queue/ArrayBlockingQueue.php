@@ -1,6 +1,8 @@
 <?php
 
-namespace Concurrent;
+namespace Concurrent\Queue;
+
+use Concurrent\ThreadInterface;
 
 class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 {
@@ -17,6 +19,10 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     public $count = 0;
 
     public $lock;
+
+    public $capacity;
+
+    public const DEFAULT_CAPACITY = 9999;
 
     /**
      * Circularly increment i.
@@ -61,23 +67,25 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     /**
      * Inserts element at current put position, advances
      */
-    private function insert($x, InterruptibleProcess $process = null): void
+    private function insert($x, ThreadInterface $thread = null): void
     {
         $this->items[$this->putIndex] = $x;
         $this->putIndex = $this->inc($this->putIndex);
         $this->count += 1;
-        if ($process !== null) {
-            $process->push(serialize($x));
+        if ($thread !== null) {
+            $thread->push(serialize($x));
         }
     }
 
-    public function __construct(int $capacity, bool $fair = false, $c = null)
+    public function __construct(int $capacity = self::DEFAULT_CAPACITY, bool $fair = false, $c = null)
     {
         $this->lock = new \Swoole\Lock(SWOOLE_MUTEX);
         if ($capacity < 0) {
             throw new \Exception("Illegal capacity");
         }
-        for ($i = 0; $i < $capacity; $i += 1) {
+        //do not allow capacity to go to infinity
+        $this->capacity = $capacity;    
+        for ($i = 0; $i < $this->capacity; $i += 1) {
             $this->items[] = null;
         }
         $i = 0;
@@ -96,10 +104,10 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
             $this->lock->unlock();
         }
         $this->count = $i;
-        $this->putIndex = ($i === $capacity) ? 0 : $i;
+        $this->putIndex = ($i === $this->capacity) ? 0 : $i;
     }
 
-    public function offer($e, InterruptibleProcess $process = null): bool
+    public function offer($e, ThreadInterface $thread = null): bool
     {
         self::checkNotNull($e);
         $this->lock->trylock();
@@ -107,7 +115,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
             if ($this->count === count($this->items)) {
                 return false;
             } else {
-                $this->insert($e, $process);
+                $this->insert($e, $thread);
                 return true;
             }
         } finally {
@@ -115,23 +123,23 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         }
     }
 
-    public function poll(int $timeout, string $unit, InterruptibleProcess $process)
+    public function poll(int $timeout, string $unit, ThreadInterface $thread)
     {
         $nanos = TimeUnit::toNanos($timeout, $unit);
         $this->lock->trylock();
         try {
             time_nanosleep(0, $nanos);
-            return $process->pop();
+            return $thread->pop();
         } finally {
             $this->lock->unlock();
         }
     }
 
-    public function take(InterruptibleProcess $process)
+    public function take(ThreadInterface $thread)
     {
         $this->lock->trylock();
         try {
-            return $process->pop();
+            return $thread->pop();
         } finally {
             $this->lock->unlock();
         }

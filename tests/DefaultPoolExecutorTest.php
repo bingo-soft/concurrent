@@ -3,16 +3,11 @@
 namespace Tests;
 
 use PHPUnit\Framework\TestCase;
-use Concurrent\{
-    ArrayBlockingQueue,
-    InterruptibleProcess,
-    ProcessPoolExecutor,
-    RunnableInterface,
-    TimeUnit,
-    Worker
-};
+use Concurrent\Queue\ArrayBlockingQueue;
+use Concurrent\Time\TimeUnit;
+use Concurrent\Executor\DefaultPoolExecutor;
 
-class PoolExecutorTest extends TestCase
+class DefaultPoolExecutorTest extends TestCase
 {
     protected function setUp(): void
     {
@@ -51,8 +46,8 @@ class PoolExecutorTest extends TestCase
 
     public function testTaskExecution(): void
     {
-        $workQueue = new ArrayBlockingQueue(3);
-        $pool = new ProcessPoolExecutor(3, 0, TimeUnit::SECONDS, $workQueue);
+        /*$workQueue = new ArrayBlockingQueue(10);*/
+        $pool = new DefaultPoolExecutor(3/*, 0, TimeUnit::MILLISECONDS, $workQueue*/);
         $task1 = new TestTask("task 1");
         $task2 = new TestTask("task 2");
         $task3 = new TestTask("task 3");

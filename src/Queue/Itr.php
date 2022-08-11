@@ -1,6 +1,6 @@
 <?php
 
-namespace Concurrent;
+namespace Concurrent\Queue;
 
 class Itr extends \ArrayIterator
 {
