@@ -8,7 +8,10 @@ use Concurrent\{
     ThreadInterface
 };
 use Concurrent\TimeUnit;
-use Concurrent\Queue\ArrayBlockingQueue;
+use Concurrent\Queue\{
+    ArrayBlockingQueue,
+    BlockingQueueInterface
+};
 use Concurrent\Worker\WorkerFactory;
 
 class DefaultPoolExecutor implements ExecutorServiceInterface

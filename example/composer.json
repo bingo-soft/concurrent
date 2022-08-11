@@ -1,0 +1,16 @@
+{  
+    "license": "MIT",
+    "authors": [{
+        "name": "Bingo-Soft",
+        "email": "bingosoft@bk.ru"
+    }],
+    "description": "Example of using DefaultPoolExecutor",
+    "require": {
+        "bingo-soft/concurrent": "^1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Example\\": "./src"
+        }
+    }
+}
