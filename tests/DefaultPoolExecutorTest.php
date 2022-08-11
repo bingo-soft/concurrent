@@ -3,9 +3,9 @@
 namespace Tests;
 
 use PHPUnit\Framework\TestCase;
-use Concurrent\Queue\ArrayBlockingQueue;
-use Concurrent\Time\TimeUnit;
 use Concurrent\Executor\DefaultPoolExecutor;
+use Concurrent\Queue\ArrayBlockingQueue;
+use Concurrent\TimeUnit;
 
 class DefaultPoolExecutorTest extends TestCase
 {

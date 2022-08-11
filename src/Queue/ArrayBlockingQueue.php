@@ -2,7 +2,10 @@
 
 namespace Concurrent\Queue;
 
-use Concurrent\ThreadInterface;
+use Concurrent\{
+    ThreadInterface,
+    TimeUnit
+};
 
 class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 {

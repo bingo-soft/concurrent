@@ -7,7 +7,7 @@ use Concurrent\{
     RunnableInterface,
     ThreadInterface
 };
-use Concurrent\Time\TimeUnit;
+use Concurrent\TimeUnit;
 use Concurrent\Queue\ArrayBlockingQueue;
 use Concurrent\Worker\WorkerFactory;
 
