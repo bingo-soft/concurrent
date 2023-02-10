@@ -4,7 +4,8 @@ namespace Concurrent\Worker;
 
 use Concurrent\{
     ExecutorServiceInterface,
-    RunnableInterface
+    RunnableInterface,
+    ThreadInterface
 };
 
 class ProcessWorker extends \Swoole\Lock implements RunnableInterface
@@ -25,8 +26,9 @@ class ProcessWorker extends \Swoole\Lock implements RunnableInterface
         $this->firstTask = $firstTask;
         $this->executor = $executor;
         $scope = $this;
-        $this->thread = new InterruptibleProcess(function ($process) use ($scope) {
-            $scope->run();
+        $args = $executor->getScopeArguments();
+        $this->thread = new InterruptibleProcess(function ($process) use ($scope, $args) {
+            $scope->run($process, ...$args);
         }, false);
         $this->thread->useQueue(1, 2);
     }
@@ -37,8 +39,8 @@ class ProcessWorker extends \Swoole\Lock implements RunnableInterface
     }
 
     /** Delegates main run loop to outer runWorker  */
-    public function run(): void
+    public function run(ThreadInterface $process, ...$args): void
     {
-        $this->executor->runWorker($this);
+        $this->executor->runWorker($this, $process, ...$args);
     }
 }

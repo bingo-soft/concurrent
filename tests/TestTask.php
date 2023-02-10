@@ -2,7 +2,10 @@
 
 namespace Tests;
 
-use Concurrent\RunnableInterface;
+use Concurrent\{
+    RunnableInterface,
+    ThreadInterface
+};
 
 class TestTask implements RunnableInterface, \Serializable
 {
@@ -31,7 +34,7 @@ class TestTask implements RunnableInterface, \Serializable
         return $this->name;
     }
 
-    public function run(): void
+    public function run(ThreadInterface $process, ...$args): void
     {
         $count = 0;
         $num = 2;
@@ -50,6 +53,6 @@ class TestTask implements RunnableInterface, \Serializable
             }
             $num += 1;
         }
-        file_put_contents("log.txt", sprintf("Task '%s' completed. Calculated prime number is %s\n", $this->name, $prime), FILE_APPEND);
+        //file_put_contents("log.txt", sprintf("Task '%s' completed. Calculated prime number is %s\n", $this->name, $prime), FILE_APPEND);
     }
 }

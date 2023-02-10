@@ -2,7 +2,10 @@
 
 namespace Concurrent\Task;
 
-use Concurrent\RunnableInterface;
+use Concurrent\{
+    RunnableInterface,
+    ThreadInterface
+};
 
 abstract class TimerTask implements RunnableInterface
 {
@@ -50,7 +53,7 @@ abstract class TimerTask implements RunnableInterface
     /**
      * The action to be performed by this timer task.
      */
-    abstract public function run(): void;
+    abstract public function run(ThreadInterface $process, ...$args): void;
 
     public function cancel(): bool
     {

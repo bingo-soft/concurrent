@@ -67,6 +67,8 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
      */
     private $poolSize;
 
+    private $scopeArguments = [];
+
     // Packing and unpacking ctl
     private static function runStateOf(int $c): int
     {
@@ -437,7 +439,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
         }
     }
 
-    public function runWorker(RunnableInterface $w): void
+    public function runWorker(RunnableInterface $w, ThreadInterface $process, ...$args): void
     {
         $firstTask = $w->firstTask;
         $queuedTask = null;
@@ -450,11 +452,11 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
                     $thrown = null;
                     try {
                         if ($firstTask !== null) {
-                            $firstTask->run();
+                            $firstTask->run($process, ...$args);
                         } elseif ($queuedTask !== null) {
                             //take care
                             $this->compareAndDecrementQueueSize($this->queueSize->get());
-                            $queuedTask->run();
+                            $queuedTask->run($process, ...$args);
                         }
                     } catch (\Exception $x) {
                         fwrite(STDERR, sprintf("Exception in runWorker: %s\n", $x->getMessage()));
@@ -618,5 +620,15 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
 
     protected function terminated(): void
     {
+    }
+
+    public function setScopeArguments(...$args)
+    {
+        $this->scopeArguments = $args;
+    }
+
+    public function getScopeArguments()
+    {
+        return $this->scopeArguments;
     }
 }
