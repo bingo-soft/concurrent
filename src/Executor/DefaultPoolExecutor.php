@@ -607,11 +607,16 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
                 if (self::runStateAtLeast($this->ctl->get(), self::TERMINATED)) {
                     return true;
                 }
-                if ($nanos <= 0) {
+                if ($nanos <= 0 || $timeout <= 0) {
                     return false;
                 }
-                time_nanosleep(0, $nanos);
-                $nanos = -1;
+                if ($unit == TimeUnit::SECONDS) {
+                    sleep(1);
+                    $timeout -= 1;
+                } else {
+                    time_nanosleep(0, $nanos);
+                    $nanos = -1;
+                }
             }
         } finally {
             $this->mainLock->unlock();
