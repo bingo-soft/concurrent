@@ -53,7 +53,7 @@ abstract class TimerTask implements RunnableInterface
     /**
      * The action to be performed by this timer task.
      */
-    abstract public function run(ThreadInterface $process, ...$args): void;
+    abstract public function run(ThreadInterface $process = null, ...$args): void;
 
     public function cancel(): bool
     {

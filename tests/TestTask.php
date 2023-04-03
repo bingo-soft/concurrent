@@ -34,7 +34,7 @@ class TestTask implements RunnableInterface, \Serializable
         return $this->name;
     }
 
-    public function run(ThreadInterface $process, ...$args): void
+    public function run(ThreadInterface $process = null, ...$args): void
     {
         $count = 0;
         $num = 2;

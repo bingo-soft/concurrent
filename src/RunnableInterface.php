@@ -4,5 +4,5 @@ namespace Concurrent;
 
 interface RunnableInterface
 {
-    public function run(ThreadInterface $process, ...$args): void;
+    public function run(ThreadInterface $process = null, ...$args): void;
 }

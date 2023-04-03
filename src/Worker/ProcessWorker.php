@@ -39,7 +39,7 @@ class ProcessWorker extends \Swoole\Lock implements RunnableInterface
     }
 
     /** Delegates main run loop to outer runWorker  */
-    public function run(ThreadInterface $process, ...$args): void
+    public function run(ThreadInterface $process = null, ...$args): void
     {
         $this->executor->runWorker($this, $process, ...$args);
     }
