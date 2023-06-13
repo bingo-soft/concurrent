@@ -1,5 +1,0 @@
-Task 'task 2' completed. Calculated prime number is 17389
-Task 'task 3' completed. Calculated prime number is 17389
-Task 'task 1' completed. Calculated prime number is 17389
-Task 'task 4' completed. Calculated prime number is 17389
-Task 'task 5' completed. Calculated prime number is 17389

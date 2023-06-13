@@ -7,7 +7,7 @@ use Concurrent\{
     ThreadInterface
 };
 
-class TestTask implements RunnableInterface, \Serializable
+class TestTask implements RunnableInterface
 {
     private $name;
 
@@ -16,17 +16,16 @@ class TestTask implements RunnableInterface, \Serializable
         $this->name = $name;
     }
 
-    public function serialize()
+    public function __serialize(): array
     {
-        return json_encode([
+        return [
             'name' => $this->name
-        ]);
+        ];
     }
 
-    public function unserialize($data)
+    public function __unserialize(array $data): void
     {
-        $json = json_decode($data);
-        $this->name = $json->name;
+        $this->name = $data['name'];
     }
 
     public function getName(): string
@@ -53,6 +52,5 @@ class TestTask implements RunnableInterface, \Serializable
             }
             $num += 1;
         }
-        //file_put_contents("log.txt", sprintf("Task '%s' completed. Calculated prime number is %s\n", $this->name, $prime), FILE_APPEND);
     }
 }
