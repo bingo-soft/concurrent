@@ -12,6 +12,8 @@ use Util\Net\{
 class LockSupport
 {
     private static $port;
+    private static $permits;
+    private static $blocks;
 
     private function __construct()
     {
@@ -21,6 +23,14 @@ class LockSupport
     {
         if (self::$port === null) {
             self::$port = new \Swoole\Atomic\Long($port);
+
+            self::$permits = new \Swoole\Table(128);
+            self::$permits->column('permit', \Swoole\Table::TYPE_INT, 4);
+            self::$permits->create();
+
+            self::$blocks = new \Swoole\Table(128);
+            self::$blocks->column('blocked', \Swoole\Table::TYPE_INT, 4);
+            self::$blocks->create();
         }
 
         $server = new InterruptibleProcess(function ($process) use ($port) {
@@ -57,18 +67,26 @@ class LockSupport
 
     public static function unpark(int $pid): void
     {
-        //@TODO implement permit
-        /*//subsequent call does nothing
-        if ($thread->permit) {
+        $permit = self::$permits->get((string) $pid);
+        //if 1, just return, no need to unpark twice
+        if ($permit !== false && $permit['permit'] === 1) {
+            //fwrite(STDERR, $pid . ": Unpark just returns, because thread was already unparked\n");
             return;
         }
-        //consume permit
-        if (!thread->permit) {
-            $thread->permit = true;
-        }*/
-        $client = new Socket("localhost", self::$port->get());
-        $client->write($pid . ' ');
-        $client->close();
+        //consume the permit
+        if ($permit === false || $permit['permit'] === 0) {
+            self::$permits->set((string) $pid, ['permit' => 1]);
+        }
+
+        $block = self::$blocks->get((string) $pid);
+        //fwrite(STDERR, $pid . ": Try to unpark, check permit " . json_encode($permit) . ", block " . json_encode($block) . "\n");
+        if ($block !== false && $block['blocked'] === 1) {
+            //No need to unpark a thread, that was not yet parked
+            //fwrite(STDERR, $pid . ": Unpark and send message will take place\n");
+            $client = new Socket("localhost", self::$port->get());
+            $client->write($pid . ' ');
+            $client->close();
+        }
     }
 
     public static function park(ThreadInterface $thread): void
@@ -84,25 +102,34 @@ class LockSupport
 
     private static function doPark(ThreadInterface $thread): void
     {
-        /*@TODO implement permit logic
+        /*@TODO
         //only immediately return
         if ($this->interrupted) {
             return;
-        }
-        //consume permit, immediately return
-        if ($this->permit === true) {
-            $this->permit = false;
-            return;
         }*/
-        $client = new Socket('localhost', self::$port->get());
-        //Handshake message
-        $client->write('h' . $thread->pid. ' ');
-        while($res = $client->read(8192)) {
-            $notifications = explode(' ', $res);
-            foreach ($notifications as $notification) {
-                if (is_numeric($notification) && intval($notification) == $thread->pid) {
-                    $client->close();
-                    break(2);
+        $permit = self::$permits->get((string) $thread->pid);
+        //fwrite(STDERR, $thread->pid . ": Try to park the thread, check permits: " . json_encode($permit) . "\n");
+        if ($permit !== false && $permit['permit'] === 1) {
+            //fwrite(STDERR, $thread->pid . ": Thread consumed permit and does not block");
+            self::$permits->set((string) $thread->pid, ['permit' => 0]);
+        } else {
+            $block = self::$blocks->get((string) $thread->pid);
+            if ($permit === false && ($block === false || $block['blocked'] === 0)) {
+                self::$blocks->set((string) $thread->pid, ['blocked' => 1]);
+                //fwrite(STDERR, $thread->pid . ": Thread is parked and blocked\n");
+                $client = new Socket('localhost', self::$port->get());
+                //Handshake message
+                $client->write('h' . $thread->pid. ' ');
+                //Blocking and waiting a message from unpark call            
+                while($res = $client->read(8192)) {
+                    $notifications = explode(' ', $res);
+                    foreach ($notifications as $notification) {
+                        if (is_numeric($notification) && intval($notification) == $thread->pid) {
+                            self::$blocks->set((string) $thread->pid, ['blocked' => 0]);
+                            $client->close();
+                            break(2);
+                        }
+                    }
                 }
             }
         }

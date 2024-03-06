@@ -12,7 +12,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * If head exists, its waitStatus is guaranteed not to be
      * CANCELLED.
      */
-    private $head;
+    public $head;
 
     /**
      * Tail of the wait queue, lazily initialized.  Modified only via
@@ -25,6 +25,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     private $state;
 
+    //Synchronization queue
     private $queue;
 
     /**
@@ -35,18 +36,17 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     {
         $this->state = new \Swoole\Atomic\Long(0);
 
-        $queue = new \Swoole\Table(1024);
+        $this->head = new \Swoole\Atomic\Long(-1);
+        $this->tail = new \Swoole\Atomic\Long(-1);
+
+        $queue = new \Swoole\Table(128);
         $queue->column('next', \Swoole\Table::TYPE_INT, 8);
         $queue->column('prev', \Swoole\Table::TYPE_INT, 8);
         $queue->column('pid', \Swoole\Table::TYPE_INT, 8);
         $queue->column('nextWaiter', \Swoole\Table::TYPE_INT, 8);
         $queue->column('waitStatus', \Swoole\Table::TYPE_INT, 8);
         $queue->create();
-
         $this->queue = $queue;
-
-        $this->head = new \Swoole\Atomic\Long(-1);
-        $this->tail = new \Swoole\Atomic\Long(-1);
     }
     
     public function getQueue(): \Swoole\Table
@@ -109,26 +109,28 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param node the node to insert
      * @return node's predecessor
      */
-    public function enq(int $node): int
+    public function enq(array &$node): int
     {
         for (;;) {            
             $t = $this->tail->get();
             if ($t === -1) { // Must initialize
                 if ($this->initHead()) {
-                    $this->queue->set((string) $this->head->get(), ['next' => 0, 'prev' => 0, 'pid' => $this->head->get(), 'nextWaiter' =>  0, 'waitStatus' => 0]);
+                    $this->queue->set((string) $this->head->get(), ['next' => -1, 'prev' => -1, 'pid' => 0, 'nextWaiter' =>  -1, 'waitStatus' => 0]);
                     $this->tail->set($this->head->get());
+                    //fwrite(STDERR, $node['pid'] . ": Dummy head and tail initiated\n");
                 }
             } else {
-                $pid = $node;
-                
-                $nData = $this->queue->get((string) $pid);
-                $nData['prev'] = $t;
-                $this->queue->set((string) $pid, $nData);
+                $pid = $node['pid'];                
+                $node['prev'] = $t;
+                $this->queue->set((string) $pid, $node);
 
-                if ($this->compareAndSetTail($t, $node)) {
+                //fwrite(STDERR, $pid . ": Enqueue node (1): " . json_encode($node) . "\n");
+
+                if ($this->compareAndSetTail($t, $node['pid'])) {
                     $tailData = $this->queue->get((string) $t);
                     $tailData['next'] = $pid;
                     $this->queue->set((string) $t, $tailData);
+                    //fwrite(STDERR, $t . ": Enqueue node (2): " . json_encode($tailData) . "\n");
                     return $t;
                 }
             }
@@ -147,18 +149,21 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         } else {
             $nData = ['next' => -1, 'prev' => -1, 'pid' => $thread->pid, 'nextWaiter' => 0, 'waitStatus' => 0];
         }
-        $this->queue->get((string) $thread->pid, $nData);
+        $this->queue->set((string) $thread->pid, $nData);
         // Try the fast path of enq; backup to full enq on failure
         $pred = $this->tail;
         if ($pred->get() !== -1) {
+            $nData['prev'] = $pred->get();
             if ($this->compareAndSetTail($pred->get(), $thread->pid)) {
                 $predData = $this->queue->get((string) $pred->get());
                 $predData['next'] = $thread->pid;
                 $this->queue->set((string) $pred->get(), $predData);
-                return $thread->pid;
+                return $nData;
             }
         }
-        $this->enq($thread->pid);
+        //fwrite(STDERR, $thread->pid . ": Call addWaiter, move node to sync queue, node: " . json_encode($nData) . "\n");
+        $this->enq($nData);
+        return $nData;
     }
 
     /**
@@ -170,7 +175,22 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     private function setHead(int $node): void
     {
-        $this->head->set($node);
+        $nData = $this->queue->get((string) $node);
+        $this->queue->del((string) $node);
+        $this->head->set(0);
+
+        $next = $nData['next'];
+
+        if ($this->tail->get() == $node) {
+            $this->tail->set(0);
+            $next = -1;
+        } else {
+            $nextData = $this->queue->get((string) $next);
+            $nextData['prev'] = $nData['prev'];
+            $this->queue->set((string) $next, $nextData);
+        }
+        //@TODO. Check of setting nextWaiter and waitStatus
+        $this->queue->set((string) $this->head->get(), ['next' => $next, 'prev' => -1, 'pid' => 0, 'nextWaiter' =>  $nData['nextWaiter'], 'waitStatus' => $nData['waitStatus']]);
     }
 
     /**
@@ -187,8 +207,9 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
          */
         $nData = $this->queue->get((string) $node);
         $ws = $nData['waitStatus'];
+        //fwrite(STDERR, "$node: Will try to unpark successor, waitStatus $ws\n");
         if ($ws < 0) {
-            $this->compareAndSetWaitStatus($node, $ws, 0);
+            $this->compareAndSetWaitStatus($nData, $ws, 0);
         }
 
         /*
@@ -209,6 +230,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             }
         }
         if ($s !== null) {
+            //fwrite(STDERR, "$node: Actual unpark will take place here, thread to be unparked id $s\n");
             LockSupport::unpark($s);
         }
     }
@@ -233,15 +255,15 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
          */
         for (;;) {
             $h = $this->head;
-            if ($h->get() !== -1 && $h->get() != $this->tail->get()) {
+            if ($h->get() !== -1 && $h->get() !== $this->tail->get()) {
                 $hData = $this->queue->get((string) $h->get());
                 $ws = $hData['waitStatus'];
                 if ($ws == Node::SIGNAL) {
-                    if (!$this->compareAndSetWaitStatus($h->get(), /*Node::SIGNAL*/$ws, 0)) {
+                    if (!$this->compareAndSetWaitStatus($hData, Node::SIGNAL, 0)) {
                         continue;            // loop to recheck cases
                     }
-                    $this->unparkSuccessor($h);
-                } elseif ($ws == 0 && !$this->compareAndSetWaitStatus($h->get(), $ws, Node::PROPAGATE)) {
+                    $this->unparkSuccessor($h->get());
+                } elseif ($ws === 0 && !$this->compareAndSetWaitStatus($hData, $ws, Node::PROPAGATE)) {
                     continue;                // loop on failed CAS
                 }
             }
@@ -311,7 +333,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     private function cancelAcquire(?int $node): void
     {
         // Ignore if node doesn't exist
-        if ($node == null) {
+        if ($node === null) {
             return;
         }
 
@@ -319,18 +341,18 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         $nodeData = $this->queue->get((string) $node);
         $pred = $nodeData['prev'];
         $predData = $this->queue->get((string) $pred);        
-        while ($predData !== false && $predData['waitStatus'] > 0) {
+        while ($predData['waitStatus'] > 0) {
             $pred = $predData['prev'];
 
             $nodeData['prev'] = $pred;
             $this->queue->set((string) $node, $nodeData);
 
-            $predData = $this->queue->get((string) $pred);
+            $nData = $this->queue->get((string) $pred);
         }
         // predNext is the apparent node to unsplice. CASes below will
         // fail if not, in which case, we lost race vs another cancel
         // or signal, so no further action is necessary.
-        // $predNext = $pred->next;
+ 
         $predNext = $this->queue->get((string) $pred, 'next');
 
         // Can use unconditional write instead of CAS here.
@@ -348,7 +370,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             $ws = null;
             if ($pred != $this->head->get() &&
                 (($ws = $this->queue->get((string) $pred, 'waitStatus')) == Node::SIGNAL ||
-                 ($ws <= 0 && $this->compareAndSetWaitStatus($pred, $ws, Node::SIGNAL))) &&
+                 ($ws <= 0 && $this->compareAndSetWaitStatus($predData, $ws, Node::SIGNAL))) &&
                  $this->queue->get((string) $pred, 'pid') !== 0) {
                 $next = $nodeData['next'];
                 if ($next !== 0 && $this->queue->get((string) $next, 'waitStatus') <= 0) {
@@ -361,7 +383,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             //node.next = node;
             $nodeData = $this->queue->get((string) $node);
             $nodeData['next'] = $node;
-            $this->queue->get((string) $node, $nodeData);      
+            $this->queue->set((string) $node, $nodeData);      
         }
     }
 
@@ -374,12 +396,12 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param node the node
      * @return {@code true} if thread should block
      */
-    private static function shouldParkAfterFailedAcquire(int $pred, int $node): bool
+    private function shouldParkAfterFailedAcquire(int $pred, int $node): bool
     {
-        $pThread = $pred;
-        $pData = $this->queue->get((string) $pThread);
+        $pData = $this->queue->get((string) $pred);
         $nData = $this->queue->get((string) $node);
         $ws = $pData['waitStatus'];
+        //fwrite(STDERR, $node . ": Call of shouldParkAfterFailedAcquire happening, prev node: " . json_encode($pData) . ", cur node: " . json_encode($nData) . "\n");
         if ($ws == Node::SIGNAL) {
             /*
              * This node has already set status asking a release
@@ -396,8 +418,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                 $pred = $pData['prev'];
                 $nData['prev'] = $pred;
                 $this->queue->set((string) $node, $nData);
-
-                $pData = $this->queue->get((string) $pred); 
+                $pData = $this->queue->get((string) $pred);
             } while ($pData['waitStatus'] > 0);
             $pData['next'] = $node;
             $this->queue->set((string) $pData['pid'], $nData);
@@ -407,7 +428,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
              * need a signal, but don't park yet.  Caller will need to
              * retry to make sure it cannot acquire before parking.
              */
-            $this->compareAndSetWaitStatus($pred, $ws, Node::SIGNAL);
+            $this->compareAndSetWaitStatus($pData, $ws, Node::SIGNAL);
         }
         return false;
     }
@@ -427,6 +448,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     private function parkAndCheckInterrupt(ThreadInterface $thread): bool
     {
+        //fwrite(STDERR, $thread->pid . ": Call  parkAndCheckInterrupt trying to park thread again\n");
         LockSupport::park($thread/*, $this*/);
         return $thread->isInterrupted();
     }
@@ -448,24 +470,28 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param arg the acquire argument
      * @return {@code true} if interrupted while waiting
      */
-    public function acquireQueued(ThreadInterface $thread, int $arg): bool
+    public function acquireQueued(ThreadInterface $thread, array $node, int $arg): bool
     {
         $failed = true;
         try {
             $interrupted = false;
             for (;;) {
                 $predData = $this->queue->get((string) $thread->pid);
-                $p = $predData['prev'];                
+                $p = $predData['prev'];
+                //fwrite(STDERR, $thread->pid . ": Predecessor " . json_encode($predData) . ", head: " . $this->head->get() . ", prev: $p " . json_encode($node) . "\n");
                 if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($thread->pid);
-                    $pData = $this->queue->get((string) $p);
-                    $pData['next'] = 0;
-                    $this->queue->set((string) $p, $pData);   
+                    $this->setHead($thread->pid);                   
+
+                    //$pData = $this->queue->get((string) $p);
+                    //$pData['next'] = -1;
+                    //$this->queue->set((string) $p, $pData);
+                    
+                    //fwrite(STDERR, $thread->pid . ": Head after acquireQueued: " . json_encode($this->queue->get((string) $this->head->get())) . "\n");
+                    //fwrite(STDERR, $thread->pid . ": Tail after acquireQueued: " . json_encode($this->queue->get((string) $this->tail->get())) . "\n");
                     $failed = false;
                     return $interrupted;
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) &&
-                    $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
                     $interrupted = true;
                 }
             }
@@ -490,15 +516,15 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                 $p = $nData['prev'];
                 if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
                     $this->setHead($thread->pid);
-                    $pData = $this->queue->get((string) $p);
-                    $pData['next'] = 0;
-                    $this->queue->set((string) $p, $pData);  
+                    //$pData = $this->queue->get((string) $p);
+                    //$pData['next'] = -1;
+                    //$this->queue->set((string) $p, $pData);  
                     $failed = false;                    
                     return;
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) &&
-                    $this->parkAndCheckInterrupt($thread))
-                    throw new InterruptedException();
+                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
+                    throw new \Exception("Interrupted");
+                }
             }
         } finally {
             if ($failed) {
@@ -528,9 +554,9 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                 $p = $nData['prev'];
                 if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
                     $this->setHead($thread->pid);
-                    $pData = $this->queue->get((string) $p);
-                    $pData['next'] = 0;
-                    $this->queue->set((string) $p, $pData);
+                    //$pData = $this->queue->get((string) $p);
+                    //$pData['next'] = -1;
+                    //$this->queue->set((string) $p, $pData);
                     $failed = false;
                     return true;
                 }
@@ -571,7 +597,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                     if ($r >= 0) {
                         $this->setHeadAndPropagate($thread->pid, $r);
                         $pData = $this->queue->get((string) $p);
-                        $pData['next'] = 0;
+                        $pData['next'] = -1;
                         $this->queue->set((string) $p, $pData);
 
                         if ($interrupted) {
@@ -581,8 +607,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                         return;
                     }
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) &&
-                    $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
                     $interrupted = true;
                 }
             }
@@ -610,15 +635,14 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                     if ($r >= 0) {
                         $this->setHeadAndPropagate($thread->pid, $r);
                         $pData = $this->queue->get((string) $p);
-                        $pData['next'] = 0;
+                        $pData['next'] = -1;
                         $this->queue->set((string) $p, $pData);
 
                         $failed = false;
                         return;
                     }
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) &&
-                    $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
                     throw new \Exception("Interrupted");
                 }
             }
@@ -653,7 +677,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                     if ($r >= 0) {
                         $this->setHeadAndPropagate($thread->pid, $r);
                         $pData = $this->queue->get((string) $p);
-                        $pData['next'] = 0;
+                        $pData['next'] = -1;
                         $this->queue->set((string) $p, $pData);
 
                         $failed = false;
@@ -837,7 +861,12 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     public function acquire(ThreadInterface $thread, int $arg)
     {
         if (!$this->tryAcquire($thread, $arg)) {
-            if ($this->acquireQueued($thread, $arg)) {
+            //fwrite(STDERR, $thread->pid . ": Acquire failed, call addWaiter\n");
+            $node = $this->addWaiter($thread, 1);
+            //fwrite(STDERR, $thread->pid . ": Node after addWaiter: " . json_encode($node). "\n");
+            //fwrite(STDERR, $thread->pid . ": Head after addWaiter: " . json_encode($this->queue->get((string) $this->head->get())). "\n");
+            //fwrite(STDERR, $thread->pid . ": Tail after addWaiter: " . json_encode($this->queue->get((string) $this->tail->get())). "\n");
+            if ($this->acquireQueued($thread, $node, $arg)) {
                 self::selfInterrupt($thread);
             }
         }
@@ -904,12 +933,16 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     public function release(ThreadInterface $thread, int $arg): bool
     {
+        //fwrite(STDERR, $thread->pid . ": Call release\n");
         if ($this->tryRelease($thread, $arg)) {
             $h = $this->head;
             $hData = $h->get() !== -1 ? $this->queue->get((string) $h->get()) : false;
-            if ($hData !== false && $hData['waitStatus'] != 0) {
-                $this->unparkSuccessor($h->get());
+            //fwrite(STDERR, $thread->pid . ": Try release is successfull, head: " . $h->get(). ", headData: " . json_encode($hData) . "\n");
+            if ($hData !== false && $hData['waitStatus'] !== 0) {
+                //fwrite(STDERR, $thread->pid . ": Will release and unpark successor of node: " . json_encode($hData) . "\n");
+                $this->unparkSuccessor($h->get());                
             }
+            //fwrite(STDERR, $thread->pid . ": Thread released the lock\n");
             return true;
         }
         return false;
@@ -1318,15 +1351,16 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param thread the thread
      * @return true if is reacquiring
      */
-    public function isOnSyncQueue(ThreadInterface $thread): bool
+    public function isOnSyncQueue(int $node, array $nData): bool
     {
-        $nData = $this->queue->get((string) $thread->pid);
-        $pData = $this->queue->get((string) $nData['prev']);
         //When Node() is predicessor, then $nData['prev'] === 0, but it is not null
-        if ($nData['waitStatus'] == Node::CONDITION || ($nData['prev'] === 0 && $pData['pid'] !== 0)) {
+        $nData = $this->queue->get((string) $node);
+        //fwrite(STDERR, $nData['pid'] . ": Check isOnSyncQueue of node " . json_encode($nData) . "\n");
+        if ($nData === false || $nData['waitStatus'] == Node::CONDITION || $nData['prev'] === -1) {
             return false;
         }
-        if ($nData['next'] !== 0) {// If has successor, it must be on queue
+        if ($nData['next'] !== -1) {// If has successor, it must be on queue
+            //fwrite(STDERR, $nData['pid'] . ": Call isOnSyncQueue and return true for node " . json_encode($nData) . "\n");
             return true;
         }
         /*
@@ -1337,7 +1371,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
          * unless the CAS failed (which is unlikely), it will be
          * there, so we hardly ever traverse much.
          */
-        return $this->findNodeFromTail($thread->pid);
+        return $this->findNodeFromTail($nData);
     }
 
     /**
@@ -1345,15 +1379,16 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * Called only when needed by isOnSyncQueue.
      * @return true if present
      */
-    private function findNodeFromTail(int $node): bool
+    private function findNodeFromTail(array $node): bool
     {
         if ($this->tail->get() !== -1) {
             $t = $this->tail->get();
+            //fwrite(STDERR, $node['pid'] . ": Call findNodeFromTail, compare nodes: " . json_encode($this->queue->get((string) $t)) . " and " . json_encode($node) . "\n" );
             for (;;) {
-                if ($t === $node) {
+                if ($t === $node['pid']) {
                     return true;
                 }
-                if ($t === 0) {
+                if ($t === -1) {
                     return false;
                 }
                 $tData = $this->queue->get((string) $t);
@@ -1370,7 +1405,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @return true if successfully transferred (else the node was
      * cancelled before signal)
      */
-    public function transferForSignal(int $node): bool
+    public function transferForSignal(array $node): bool
     {
         /*
          * If cannot change waitStatus, the node has been cancelled.
@@ -1386,9 +1421,12 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
          * case the waitStatus can be transiently and harmlessly wrong).
          */        
         $p = $this->enq($node);
-        $ws = $this->queue->get((string) $p, 'waitStatus');
-        if ($ws !== false && $ws > 0 || !$this->compareAndSetWaitStatus($p, $ws, Node::SIGNAL)) {
-            LockSupport::unpark($node);
+        $pData = $this->queue->get((string) $p);
+        if ($pData !== false) {
+            $ws = $pData['waitStatus'];
+            if (($ws !== false && $ws > 0) || !$this->compareAndSetWaitStatus($pData, $ws, Node::SIGNAL)) {
+                LockSupport::unpark($node['pid']);
+            }
         }
         return true;
     }
@@ -1400,10 +1438,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param node the node
      * @return true if cancelled before the node was signalled
      */
-    public function transferAfterCancelledWait(ThreadInterface $thread): bool
+    public function transferAfterCancelledWait(array $node): bool
     {
-        if ($this->compareAndSetWaitStatus($thread->pid, Node::CONDITION, 0)) {
-            $this->enq($thread->pid);
+        if ($this->compareAndSetWaitStatus($node, Node::CONDITION, 0)) {
+            $this->enq($node);
             return true;
         }
         /*
@@ -1548,12 +1586,22 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         return false;
     }
 
-    private function compareAndSetWaitStatus(int $node, int $expect, int $update): bool
+    private function compareAndSetWaitStatus(array &$node, int $expect, int $update): bool
     {
-        $nodeData = $this->queue->get((string) $node);
-        if ($nodeData['waitStatus'] == $expect) {
-            $nodeData['waitStatus'] = $update;
-            $this->queue->set((string) $node, $nodeData);
+        /*$from = [];
+        $ex = new \Exception();
+        for ($i = 0; $i < 10; $i += 1) {
+            try {
+                $t = $ex->getTrace()[$i];
+                $from[] = sprintf("%s.%s.%s", $t['file'], $t['function'], $t['line']);
+            } catch (\Throwable $tt) {
+            }
+        }*/
+
+        //fwrite(STDERR, $node['pid'] . ": Call compareAndSetWaitStatus on node: " . json_encode($node) .", sync node: " . json_encode($this->queue->get((string) $node['pid'])) . "\n");
+        if ($node['waitStatus'] == $expect) {
+            $node['waitStatus'] = $update;
+            $this->queue->set((string) $node['pid'], $node);
             return true;
         }
         return false;
@@ -1561,7 +1609,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
 
     private function compareAndSetNext(int $node, int $expect, ?int $update): bool
     {
-        $nodeData = $this->queue->get((string) $node);
+        $nodeData = $this->queue->get((string) $node);        
         if ($nodeData !== false && $nodeData['next'] == $expect) {
             if ($update == null) {
                 $nodeData['next'] = 0;   

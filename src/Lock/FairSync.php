@@ -17,11 +17,11 @@ class FairSync extends Sync
      */
     public function tryAcquire(ThreadInterface $current, int $arg): bool
     {
-        $c = $this->getState();
+        $c = $this->getState();        
         if ($c == 0) {
-            if (!$this->hasQueuedPredecessors($current) &&
-                $this->compareAndSetState(0, $arg)) {
+            if (!$this->hasQueuedPredecessors($current) && $this->compareAndSetState(0, $arg)) {
                 $this->setExclusiveOwnerThread($current);
+                //fwrite(STDERR, $current->pid . ": Call tryAcquire and return true, because has no predecessors, state = 0, new state = $arg\n");
                 return true;
             }
         } elseif ($current == $this->getExclusiveOwnerThread()) {
@@ -30,8 +30,19 @@ class FairSync extends Sync
                 throw new \Exception("Maximum lock count exceeded");
             }
             $this->setState($nextc);
+            //fwrite(STDERR, $current->pid . ": Call tryAcquire and return true, because exclusive, state = 0, new state = $nextc\n");
             return true;
         }
+        $from = [];
+        $ex = new \Exception();
+        for ($i = 0; $i < 10; $i += 1) {
+            try {
+                $t = $ex->getTrace()[$i];
+                $from[] = sprintf("%s.%s.%s", $t['file'], $t['function'], $t['line']);
+            } catch (\Throwable $tt) {
+            }
+        }
+        //fwrite(STDERR, $current->pid . ": Call of tryAcquire failed, return false, from " . implode(" <= ", $from) . "\n");
         return false;
     }
 }

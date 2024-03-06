@@ -14,14 +14,26 @@ class ConditionObject implements ConditionInterface
 
     private $synchronizer;
 
+    //Condition queue
+    private $queue;
+
     /**
      * Creates a new {@code ConditionObject} instance.
      */
     public function __construct(?SynchronizerInterface $synchronizer)
     {
         $this->synchronizer = $synchronizer;
-        $this->firstWaiter = new \Swoole\Atomic\Long(0);
-        $this->lastWaiter = new \Swoole\Atomic\Long(0);
+        $this->firstWaiter = new \Swoole\Atomic\Long(-1);
+        $this->lastWaiter = new \Swoole\Atomic\Long(-1);
+
+        $queue = new \Swoole\Table(128);
+        $queue->column('next', \Swoole\Table::TYPE_INT, 8);
+        $queue->column('prev', \Swoole\Table::TYPE_INT, 8);
+        $queue->column('pid', \Swoole\Table::TYPE_INT, 8);
+        $queue->column('nextWaiter', \Swoole\Table::TYPE_INT, 8);
+        $queue->column('waitStatus', \Swoole\Table::TYPE_INT, 8);
+        $queue->create();
+        $this->queue = $queue;
     }
 
     // Internal methods
@@ -30,27 +42,29 @@ class ConditionObject implements ConditionInterface
      * Adds a new waiter to wait queue.
      * @return its new wait node
      */
-    private function addConditionWaiter(ThreadInterface $thread)
+    private function addConditionWaiter(ThreadInterface $thread): array
     {
         $t = $this->lastWaiter;
-        $queue = $this->synchronizer->getQueue();
-        $lwData = $queue->get((string) $t->get());
+        $lwData = $this->queue->get((string) $t->get());
 
         // If lastWaiter is cancelled, clean out.
-        if (!empty($lwData) && $lwData['waitStatus'] != Node::CONDITION) {
+        if ($t->get() !== -1 && $lwData['waitStatus'] !== Node::CONDITION) {
             $this->unlinkCancelledWaiters();
             $t = $this->lastWaiter;
         }
-        if ($t->get() === 0) {
-            $this->firstWaiter->set($thread->pid);
-            $queue->set((string) $thread->pid, ['pid' => $thread->pid, 'waitStatus' => Node::CONDITION]);
+        $node = ['prev' => -1, 'next' => -1, 'pid' => $thread->pid, 'nextWaiter' => -1, 'waitStatus' => Node::CONDITION];
+        $this->queue->set((string) $thread->pid, $node);
+        if ($t->get() === -1) {
+            $this->firstWaiter->set($thread->pid);            
         } else {
-            $nwData = $queue->get((string) $t->get());
+            $nwData = $this->queue->get((string) $t->get());
             $nwData['nextWaiter'] = $thread->pid;
-            $queue->set((string) $t->get(), $nwData);
-            $queue->set((string) $thread->pid, ['pid' => $thread->pid, 'waitStatus' => Node::CONDITION]);
+            $this->queue->set((string) $t->get(), $nwData);
+            //fwrite(STDERR, $thread->pid . ": Set of nextWaiter " . json_encode($nwData) . "\n");
         }
         $this->lastWaiter->set($thread->pid);
+        //fwrite(STDERR, $thread->pid . ": Call of addConditionWaiter happened, first waiter " . json_encode($this->queue->get((string) $this->firstWaiter->get())) . ", lastWaiter: " . json_encode($this->queue->get((string) $this->lastWaiter->get())) . "\n");
+        return $node;
     }
 
     /**
@@ -62,16 +76,15 @@ class ConditionObject implements ConditionInterface
     private function doSignal(int $first): void
     {
         do {
-            $queue = $this->synchronizer->getQueue();
-            $fData = $queue->get((string) $first);
-            if ($fData['nextWaiter'] === 0) {
-                $this->firstWaiter->set(0);
-                $this->lastWaiter->set(0);                
+            $fData = $this->queue->get((string) $first);
+            if ($fData['nextWaiter'] === -1) {
+                $this->firstWaiter->set(-1);
+                $this->lastWaiter->set(-1);                
             }
-            $fData['nextWaiter'] = 0;
-            $queue->set((string) $first, $fData);
-        } while (!$this->synchronizer->transferForSignal($first) &&
-                 ($first = $this->firstWaiter->get()) !== 0);
+            $fData['nextWaiter'] = -1;
+            $this->queue->del((string) $first);
+        } while (!$this->synchronizer->transferForSignal($fData) &&
+                 ($first = $this->firstWaiter->get()) !== -1);
     }
 
     /**
@@ -80,17 +93,21 @@ class ConditionObject implements ConditionInterface
      */
     private function doSignalAll(int $first): void
     {
-        $this->lastWaiter->set(0);
-        $this->firstWaiter->set(0);
-        $queue = $this->synchronizer->getQueue();
+        //fwrite(STDERR, $first . ": Start calling doSignalAll, but check waiters before, first: " . json_encode($this->queue->get((string) $this->firstWaiter->get())) . ", last: " . json_encode($this->queue->get((string) $this->lastWaiter->get())). "\n");
+        $this->lastWaiter->set(-1);
+        $this->firstWaiter->set(-1);
         do {
-            $fData = $queue->get((string) $first);
+            $fData = $this->queue->get((string) $first);
             $next = $fData['nextWaiter'];
-            $fData['nextWaiter'] = 0;
-            $queue->set((string) $first, $fData);
-            $this->synchronizer->transferForSignal($first);
-            $first->set($next);
-        } while ($first !== 0);
+            //fwrite(STDERR, $first . ": Transfer for signal this node: " . json_encode($fData) . "\n");
+            $this->synchronizer->transferForSignal($fData);
+            $this->queue->del((string) $first);
+            $first = $next;
+        } while ($first !== -1);
+        
+        //fwrite(STDERR, $first . ": Head after doSignalAll: " . json_encode($this->synchronizer->getQueue()->get((string) $this->synchronizer->head->get())). "\n");
+        //fwrite(STDERR, $first . ": Next after doSignalAll: " . json_encode($this->synchronizer->getQueue()->get((string)  $this->synchronizer->getQueue()->get((string) $this->synchronizer->head->get(), 'next')  )). "\n");
+        //fwrite(STDERR, $first . ": Tail after doSignalAll: " . json_encode($this->synchronizer->getQueue()->get((string) $this->synchronizer->tail->get())). "\n");
     }
 
     /**
@@ -109,21 +126,20 @@ class ConditionObject implements ConditionInterface
      */
     private function unlinkCancelledWaiters(): void
     {
-        $t = $this->firstWaiter;
+        $t = $this->firstWaiter->get();
         $trail = null;
-        $queue = $this->synchronizer->getQueue();
-        while ($t !== 0) {
-            $tData = $queue->get((string) $t->get());
+        while ($t !== -1) {
+            $tData = $this->queue->get((string) $t);
             $next = $tData['nextWaiter'];
-            if ($tData['waitStatus'] != Node::CONDITION) {
-                $tData['nextWaiter'] = 0;
-                $queue->set((string) $t->get(), $tData);
+            if ($tData['waitStatus'] !== Node::CONDITION) {
+                $tData['nextWaiter'] = -1;
+                $this->queue->set((string) $t, $tData);
                 if ($trail === null) {
                     $this->firstWaiter->set($next);
                 } else {
-                    $trailData = $queue->get((string) $trail->get());
+                    $trailData = $this->queue->get((string) $trail);
                     $trailData['nextWaiter'] = $next;
-                    $queue->set((string) $trail->get(), $trailData);
+                    $this->queue->set((string) $trail, $trailData);
                 }
                 if ($next === 0) {
                     $this->lastWaiter->set($trail);
@@ -131,8 +147,7 @@ class ConditionObject implements ConditionInterface
             } else {
                 $trail = $t;
             }
-            //$t = $next;
-            $t->set($next);
+            $t = $next;
         }
     }
 
@@ -152,7 +167,7 @@ class ConditionObject implements ConditionInterface
             throw new \Exception("Illegal monitor state");
         }
         $first = $this->firstWaiter->get();
-        if ($first !== 0) {
+        if ($first !== -1) {
             $this->doSignal($first);
         }
     }
@@ -170,7 +185,7 @@ class ConditionObject implements ConditionInterface
             throw new \Exception("Illegal monitor state");
         }
         $first = $this->firstWaiter->get();
-        if ($first !== 0) {
+        if ($first !== -1) {
             $this->doSignalAll($first);
         }
     }
@@ -188,16 +203,16 @@ class ConditionObject implements ConditionInterface
      */
     public function awaitUninterruptibly(ThreadInterface $thread): void
     {
-        $this->addConditionWaiter($thread);
+        $node = $this->addConditionWaiter($thread);
         $savedState = $this->synchronizer->fullyRelease($thread);
         $interrupted = false;
-        while (!$this->synchronizer->isOnSyncQueue($thread)) {
+        while (!$this->synchronizer->isOnSyncQueue($thread->pid, $node)) {
             LockSupport::park($thread);
             if ($thread->isInterrupted()) {
                 $interrupted = true;
             }
         }
-        if ($this->synchronizer->acquireQueued($thread, $savedState) || $interrupted) {
+        if ($this->synchronizer->acquireQueued($thread, $node, $savedState) || $interrupted) {
             AbstractQueuedSynchronizer::selfInterrupt($thread);
         }
     }
@@ -221,8 +236,9 @@ class ConditionObject implements ConditionInterface
      */
     private function checkInterruptWhileWaiting(ThreadInterface $thread): int
     {
+        $node = $this->queue->get((string) $thread->pid);
         return $thread->isInterrupted() ?
-            ($this->synchronizer->transferAfterCancelledWait($thread) ? self::THROW_IE : self::REINTERRUPT) :
+            ($this->synchronizer->transferAfterCancelledWait($node) ? self::THROW_IE : self::REINTERRUPT) :
             0;
     }
 
@@ -256,13 +272,14 @@ class ConditionObject implements ConditionInterface
         if ($thread->isInterrupted()) {
             throw new \Exception("Interrupted");
         }
-        $this->addConditionWaiter($thread);
+        $node = $this->addConditionWaiter($thread);
         $savedState = $this->synchronizer->fullyRelease($thread);
         $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
         $interruptMode = 0;
-        while (!$this->synchronizer->isOnSyncQueue($thread)) {
+        while (!$this->synchronizer->isOnSyncQueue($thread->pid, $node)) {
             if ($nanosTimeout <= 0) {
-                $this->synchronizer->transferAfterCancelledWait($thread);
+                $tData = $this->queue->get((string) $thread->pid);
+                $this->synchronizer->transferAfterCancelledWait($tData);
                 break;
             }
             if ($nanosTimeout >= /*spinForTimeoutThreshold*/1000) {
@@ -273,7 +290,7 @@ class ConditionObject implements ConditionInterface
             }
             $nanosTimeout = $deadline - round(microtime(true)) * 1000;
         }
-        if ($this->synchronizer->acquireQueued($thread, $savedState) && $interruptMode != self::THROW_IE) {
+        if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
             $interruptMode = self::REINTERRUPT;
         }
         $queue = $this->synchronizer->getQueue();
@@ -307,13 +324,14 @@ class ConditionObject implements ConditionInterface
         if ($thread->isInterrupted()) {
             throw new \Exception("Interrupted");
         }
-        $this->addConditionWaiter($thread);
+        $node = $this->addConditionWaiter($thread);
         $savedState = $this->synchronizer->fullyRelease($thread);
         $timedout = false;
         $interruptMode = 0;
-        while (!$this->synchronizer->isOnSyncQueue($thread)) {
+        while (!$this->synchronizer->isOnSyncQueue($thread->pid, $node)) {
             if (time() > $abstime) {
-                $timedout = $this->synchronizer->transferAfterCancelledWait($thread);
+                $tData = $this->queue->get((string) $thread->pid);
+                $timedout = $this->synchronizer->transferAfterCancelledWait($tData);
                 break;
             }
             LockSupport::parkUntil($thread, $this->synchronizer, $abstime);
@@ -321,7 +339,7 @@ class ConditionObject implements ConditionInterface
                 break;
             }
         }
-        if ($this->synchronizer->acquireQueued($thread, $savedState) && $interruptMode != self::THROW_IE) {
+        if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
             $interruptMode = self::REINTERRUPT;
         }
         $queue = $this->synchronizer->getQueue();
@@ -355,15 +373,19 @@ class ConditionObject implements ConditionInterface
             if ($thread->isInterrupted()) {
                 throw new \Exception("Interrupted");
             }
-            $this->addConditionWaiter($thread);           
+            $node = $this->addConditionWaiter($thread);           
             $savedState = $this->synchronizer->fullyRelease($thread);
             $interruptMode = 0;
-             while (!$this->synchronizer->isOnSyncQueue($thread)) {                
-                LockSupport::park($thread);
+            //fwrite(STDERR, $thread->pid . ": await goes on, condition waiter node: " . json_encode($node) . ", current node in sync queue: " . json_encode($this->synchronizer->getQueue()->get((string) $thread->pid)) . "\n");
+            while (!$this->synchronizer->isOnSyncQueue($thread->pid, $node)) {
+                //fwrite(STDERR, $thread->pid . ": Thread is about to be parked\n");              
+                LockSupport::park($thread/*, $this->synchronizer*/);
+                //fwrite(STDERR, $thread->pid . ": Thread parking finished\n");      
                 if (($interruptMode = $this->checkInterruptWhileWaiting($thread)) != 0)
                     break;
             }
-            if ($this->synchronizer->acquireQueued($thread, $savedState) && $interruptMode != self::THROW_IE) {
+            //fwrite(STDERR, $thread->pid . ": await park completed, will try to acquire queued\n");           
+            if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
                 $interruptMode = self::REINTERRUPT;
             }
             $queue = $this->synchronizer->getQueue();
@@ -379,14 +401,15 @@ class ConditionObject implements ConditionInterface
             if ($thread->isInterrupted()) {
                 throw new \Exception("Interrupted");
             }
-            $this->addConditionWaiter($thread);
+            $node = $this->addConditionWaiter($thread);
             $savedState = $this->synchronizer->fullyRelease($thread);
             $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
             $timedout = false;
             $interruptMode = 0;
-            while (!$this->synchronizer->isOnSyncQueue($thread)) {
+            while (!$this->synchronizer->isOnSyncQueue($thread->pid, $node)) {
                 if ($nanosTimeout <= 0) {
-                    $timedout = $this->synchronizer->transferAfterCancelledWait($thread);
+                    $tData = $this->queue->get((string) $thread->pid);
+                    $timedout = $this->synchronizer->transferAfterCancelledWait($tData);
                     break;
                 }
                 if ($nanosTimeout >= /*spinForTimeoutThreshold*/1000) {
@@ -397,7 +420,7 @@ class ConditionObject implements ConditionInterface
                 }
                 $nanosTimeout = $deadline - round(microtime(true)) * 1000;
             }
-            if ($this->synchronizer->acquireQueued($thread, $savedState) && $interruptMode != self::THROW_IE) {
+            if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
                 $interruptMode = self::REINTERRUPT;
             }
             $queue = $this->synchronizer->getQueue();
@@ -438,9 +461,8 @@ class ConditionObject implements ConditionInterface
         if (!$this->synchronizer->isHeldExclusively()) {
             throw new \Exception("Illegal monitor state");
         }
-        $queue = $this->synchronizer->getQueue();
-        for ($w = $this->firstWaiter->get(); $w !== 0; ) {
-            $wData = $queue->get((string) $w);
+        for ($w = $this->firstWaiter->get(); $w !== -1; ) {
+            $wData = $this->queue->get((string) $w);
             if ($wData['waitStatus'] == Node::CONDITION) {
                 return true;
             }
@@ -464,9 +486,8 @@ class ConditionObject implements ConditionInterface
             throw new \Exception("Illegal monitor state");
         }
         $n = 0;
-        $queue = $this->synchronizer->getQueue();
-        for ($w = $this->firstWaiter->get(); $w !== 0; ) {
-            $wData = $queue->get((string) $w);
+        for ($w = $this->firstWaiter->get(); $w !== -1; ) {
+            $wData = $this->queue->get((string) $w);
             if ($wData['waitStatus'] == Node::CONDITION) {
                 $n += 1;
             }
@@ -490,9 +511,8 @@ class ConditionObject implements ConditionInterface
             throw new \Exception("Illegal monitor state");
         }
         $list = [];
-        $queue = $this->synchronizer->getQueue();
-        for ($w = $this->firstWaiter->get(); $w !== 0; ) {
-            $wData = $queue->get((string) $w);
+        for ($w = $this->firstWaiter->get(); $w !== -1; ) {
+            $wData = $this->queue->get((string) $w);
             if ($wData['waitStatus'] == Node::CONDITION) {
                 $t = $wData['pid'];
                 if ($t !== 0) {
