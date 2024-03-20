@@ -2,39 +2,60 @@
 
 namespace Concurrent\Worker;
 
-use Concurrent\Executor\ForkJoinPoolExecutor;
+use Concurrent\Executor\ForkJoinPool;
 use Concurrent\Queue\ForkJoinWorkQueue;
+use Concurrent\Task\ForkJoinTask;
 use Concurrent\ThreadInterface;
 
-class ForkJoinWorkerProcess implements ThreadInterface
+class ForkJoinWorker implements ThreadInterface
 {
     /*
-     * ForkJoinWorkerProcesss are managed by ForkJoinPoolExecutors and perform
+     * ForkJoinWorkers are managed by ForkJoinPools and perform
      * ForkJoinTasks.
      *
      * This class just maintains links to its pool and WorkQueue.
      */
-    public ForkJoinPoolExecutor $pool; // the pool this process works in
+    public ForkJoinPool $pool; // the pool this process works in
     public ForkJoinWorkQueue $workQueue; // work-stealing mechanics
     public $thread;
+    public $pid;
     private bool $started = false;
+    private $name;
 
     /**
-     * Creates a ForkJoinWorkerProcess operating in the given pool.
+     * Creates a ForkJoinWorker operating in the given pool.
      *
      * @param pool the pool this process works in
      */
-    public function __construct(ForkJoinPoolExecutor $pool)
+    public function __construct(ForkJoinPool $pool)
     {
-        $this->pool = $pool;
-        $this->workQueue = $pool->registerWorker($this);
-        
+        $this->pool = $pool;        
+        $this->pid = new \Swoole\Atomic\Long(0);
         $scope = $this;
         $args = $pool->getScopeArguments();
         $this->thread = new InterruptibleProcess(function ($process) use ($scope, $args) {
+            //fwrite(STDERR, getmypid() . ": new worker process started with this pid: " . $process->pid . "\n");
+            $scope->pid->set($process->pid);
+            ForkJoinTask::$fork->set((string) $process->pid, ['pid' => $process->pid]);
             $scope->run($process, ...$args);
-        }, false);
+        }, false);        
         $this->thread->useQueue(1, 2);
+        $this->workQueue = $pool->registerWorker($this);
+    }
+
+    public function getPid(): ?int
+    {
+        return $this->pid->get();
+    }
+
+    public function interrupt(): void
+    {
+        $this->thread->interrupt();
+    }
+
+    public function isInterrupted(): bool
+    {
+        return $this->thread->isInterrupted();
     }
 
     public function start(): void
@@ -48,7 +69,7 @@ class ForkJoinWorkerProcess implements ThreadInterface
      *
      * @return the pool
      */
-    public function getPool(): ForkJoinPoolExecutor
+    public function getPool(): ForkJoinPool
     {
         return $this->pool;
     }
@@ -104,9 +125,20 @@ class ForkJoinWorkerProcess implements ThreadInterface
             $exception = null;
             try {
                 $this->onStart();
-                $this->pool->runWorker($this, $process, ...$args);
+                $this->pool->runWorker($this->workQueue, $process, ...$args);
             } catch (\Throwable $ex) {
                 $exception = $ex;
+
+                /*$errorStack = [];
+                for ($i = 0; $i < 5; $i += 1) {
+                    try {
+                        $t = $ex->getTrace()[$i];
+                        $errorStack[] = sprintf("%s.%s.%s", $t['file'], $t['function'], $t['line']);
+                    } catch (\Throwable $tt) {
+                    }
+                }*/
+
+                //fwrite(STDERR, getmypid() . ": worker ERROR (1): " . $ex->getMessage() . " " . implode(" <= ", $errorStack) . "\n");
             } finally {
                 try {
                     $this->onTermination($exception);
@@ -114,6 +146,7 @@ class ForkJoinWorkerProcess implements ThreadInterface
                     if ($exception == null) {
                         $exception = $ex;
                     }
+                    fwrite(STDERR, getmypid() . ": worker ERROR (2): " . $ex->getMessage() . "\n");
                 } finally {
                     $this->pool->deregisterWorker($this, $exception);
                 }
@@ -123,5 +156,15 @@ class ForkJoinWorkerProcess implements ThreadInterface
 
     public function afterTopLevelExec(): void
     {
+    }
+
+    public function setName(string $name): void
+    {
+        $this->name = $name;
+    }
+
+    public function getName(): ?string
+    {
+        return $this->name;
     }
 }

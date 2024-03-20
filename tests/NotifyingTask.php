@@ -39,7 +39,6 @@ class NotifyingTask implements RunnableInterface
     public function run(ThreadInterface $process = null, ...$args): void
     {
         fwrite(STDERR, $process->pid . ": Sending notification signal.\n");
-        $this->notification->notifyAll($process);
-        //fwrite(STDERR, $process->pid . ": Just sent notification signal.\n");
+        $this->notification->notifyAll(/*$process*/);
     }
 }

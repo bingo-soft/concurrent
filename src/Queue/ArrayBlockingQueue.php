@@ -70,7 +70,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     /**
      * Inserts element at current put position, advances
      */
-    private function insert($x, ThreadInterface $thread = null): void
+    private function insert($x, ?ThreadInterface $thread = null): void
     {
         $this->items[$this->putIndex] = $x;
         $this->putIndex = $this->inc($this->putIndex);
@@ -110,7 +110,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         $this->putIndex = ($i === $this->capacity) ? 0 : $i;
     }
 
-    public function offer($e, ThreadInterface $thread = null): bool
+    public function offer($e, ?ThreadInterface $thread = null): bool
     {
         self::checkNotNull($e);
         $this->lock->trylock();
@@ -126,7 +126,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         }
     }
 
-    public function poll(int $timeout, string $unit, ThreadInterface $thread)
+    public function poll(int $timeout, string $unit, ?ThreadInterface $thread = null)
     {
         $nanos = TimeUnit::toNanos($timeout, $unit);
         $this->lock->trylock();
@@ -138,7 +138,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         }
     }
 
-    public function take(ThreadInterface $thread)
+    public function take(?ThreadInterface $thread = null)
     {
         $this->lock->trylock();
         try {

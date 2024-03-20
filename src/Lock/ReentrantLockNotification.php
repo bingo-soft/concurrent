@@ -15,7 +15,7 @@ class ReentrantLockNotification implements NotificationInterface
         $this->condition = $this->lock->newCondition();
     }
     
-    public function await(ThreadInterface $thread, ?int $time = null, ?string $unit = null)
+    public function await(?ThreadInterface $thread = null, ?int $time = null, ?string $unit = null)
     {
         //Thread in this and other methods represents just current thread (aka Thread.current())
         $this->lock->lock($thread);
@@ -26,7 +26,7 @@ class ReentrantLockNotification implements NotificationInterface
         }
     }
 
-    public function notify(ThreadInterface $thread): void
+    public function notify(?ThreadInterface $thread = null): void
     {
         $this->lock->lock($thread);
         try {
@@ -36,7 +36,7 @@ class ReentrantLockNotification implements NotificationInterface
         }
     }
 
-    public function notifyAll(ThreadInterface $thread): void
+    public function notifyAll(?ThreadInterface $thread = null): void
     {
         $this->lock->lock($thread);
         try {

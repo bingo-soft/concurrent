@@ -2,8 +2,9 @@
 
 namespace Concurrent\Queue;
 
-use Concurrent\Executor\ForkJoinPoolExecutor;
-use Concurrent\Worker\ForkJoinWorkerProcess;
+use Concurrent\ThreadInterface;
+use Concurrent\Executor\ForkJoinPool;
+use Concurrent\Worker\ForkJoinWorker;
 use Concurrent\Task\{
     EmptyTask,
     ForkJoinTask
@@ -25,7 +26,7 @@ class ForkJoinWorkQueue
     public const DEFAULT_SIZE = 8192;
 
     // Instance fields
-    public int $scanState = 0;    // versioned, <0: inactive; odd:scanning
+    public $scanState;            // versioned, <0: inactive; odd:scanning
     public int $stackPred = 0;    // pool stack (ctl) predecessor
     public int $nsteals = 0;      // number of steals
     public int $hint = 0;         // randomization and stealer index hint
@@ -42,8 +43,10 @@ class ForkJoinWorkQueue
     public $capacity;             // custom size of queue array
     public $allocated;            // allocation of the queue is set by pool
     private $stealCounter;        // steal counter is managed in outer context (that is pool)
+
+
     
-    public function __construct(ForkJoinPoolExecutor $pool = null, ForkJoinWorkerProcess $owner = null, int $capacity = self::MAXIMUM_QUEUE_CAPACITY, int $size = self::DEFAULT_SIZE, \Swoole\Atomic\Long $stealCounter = new \Swoole\Atomic\Long(0))
+    public function __construct(ForkJoinPool $pool = null, ForkJoinWorker $owner = null, int $capacity = self::MAXIMUM_QUEUE_CAPACITY, int $size = self::DEFAULT_SIZE, \Swoole\Atomic\Long $stealCounter = new \Swoole\Atomic\Long(0))
     {
         $this->pool = $pool;
         $this->owner = $owner;
@@ -59,11 +62,18 @@ class ForkJoinWorkQueue
         $steal->column('task', \Swoole\Table::TYPE_STRING, $size);
         $steal->create();
         $this->currentSteal = $steal;
+
+        $currentJoin = new \Swoole\Table(1);
+        $currentJoin->column('task', \Swoole\Table::TYPE_STRING, $size);
+        $currentJoin->create();
+        $this->currentJoin = $currentJoin;
         
         $this->qlock = new \Swoole\Atomic\Long(0);        
         $this->top = new \Swoole\Atomic\Long(0);
         $this->base = new \Swoole\Atomic\Long(0);
         $this->allocated = new \Swoole\Atomic\Long(0);
+        $this->scanState = new \Swoole\Atomic\Long(0);
+        $this->parker = new \Swoole\Atomic\Long(0);
     }
 
     public function setAllocated(): void
@@ -76,8 +86,13 @@ class ForkJoinWorkQueue
         return $this->allocated->get();
     }
 
+    public function getCapacity(): int
+    {
+        return $this->capacity;
+    }
+
     /**
-     * Returns an exportable index (used by ForkJoinWorkerThread).
+     * Returns an exportable index (used by ForkJoinWorker).
      */
     public function getPoolIndex(): int
     {
@@ -109,22 +124,21 @@ class ForkJoinWorkQueue
     }
 
     /**
-     * Pushes a task. Call only by owner in unshared queues.  (The
-     * shared-queue version is embedded in method externalPush.)
+     * Pushes a task.
      *
      * @param task the task. Caller must ensure non-null.
-     * @throws \Exception if array cannot be resized
      */
     public function push(ForkJoinTask $task): void
     {
-        if ($this->array->count() == $this->capacity) {
-            throw new \Exception("Queue is full");
-        }
         $base = $this->base->get();
         $top = $this->top->get();
         $nextTop = ($top + 1) % $this->capacity;
-        $this->array->set((string) $top, ['task' => serialize($task)]);
+        $stask = serialize($task);
+        $this->array->set((string) $top, ['task' => $stask]);
         $this->top->set($nextTop);
+        if ($this->array->count() <= 1 && $this->pool !== null) {
+            $this->pool->signalWork($this->pool->workQueues, $this);
+        }
     }
 
     /**
@@ -143,7 +157,13 @@ class ForkJoinWorkQueue
         $this->top->set($newTop);
         $task = $this->array->get((string) $newTop, 'task');
         $this->array->del((string) $newTop);
-        return unserialize($task);
+
+        $t = unserialize($task);
+        
+        if ($t->start == 1 || $t->start == 9376) {
+            //fwrite(STDERR, getmypid() . ": Task poped from the queue: $task\n");
+        }
+        return $t;
     }
 
     /**
@@ -155,8 +175,10 @@ class ForkJoinWorkQueue
             return null;
         }
         $base = $this->base->get();
+        
         $task = $this->array->get((string) $base, 'task');
         $this->array->del((string) $base);
+
         $this->base->set(($base + 1) % $this->capacity);
         return unserialize($task);
     }
@@ -164,7 +186,7 @@ class ForkJoinWorkQueue
     /**
      * Takes a task in FIFO order if index is base of queue and a task
      * can be claimed without contention. Specialized versions
-     * appear in ForkJoinPoolExecutor methods scan and helpStealer.
+     * appear in ForkJoinPool methods scan and helpStealer.
      */
     public function pollAt(int $index): ?ForkJoinTask
     {
@@ -182,7 +204,7 @@ class ForkJoinWorkQueue
      */
     public function nextLocalTask(): ?ForkJoinTask
     {
-        return ($this->config & ForkJoinPoolExecutor::FIFO_QUEUE) == 0 ? $this->pop() : $this->poll();
+        return ($this->config & ForkJoinPool::FIFO_QUEUE) == 0 ? $this->pop() : $this->poll();
     }
 
     /**
@@ -194,7 +216,7 @@ class ForkJoinWorkQueue
             return null;
         }
 
-        if (($this->config & ForkJoinPoolExecutor::FIFO_QUEUE) == 0) {
+        if (($this->config & ForkJoinPool::FIFO_QUEUE) == 0) {
             $newTop = ($this->top->get() - 1 + $this->capacity) % $this->capacity;
             $task = $this->array->get((string) $newTop, 'task');
             return unserialize($task);
@@ -229,26 +251,30 @@ class ForkJoinWorkQueue
     public function cancelAll(): void
     {
         $t = null;
-        if (($t = $this->currentJoin) !== null) {
-            $this->currentJoin = null;
-            ForkJoinTask::cancelIgnoringExceptions($t);
+        if (($t = $this->currentJoin->get('task', 'task')) !== false) {
+            $this->currentJoin->del('task');
+            try {
+                ForkJoinTask::cancelIgnoringExceptions(unserialize($t));
+            } catch (\Throwable $tt) {
+                
+            }
         }
-        if ($this->currentSteal !== null && ($t = $this->currentSteal->get('task') !== null)) {
+        if ($this->currentSteal !== null && ($t = $this->currentSteal->get('task', 'task')) !== false) {
             $this->currentSteal->del('task');
             ForkJoinTask::cancelIgnoringExceptions(unserialize($t));
         }
         while (($t = $this->poll()) !== null) {
-            ForkJoinTask::cancelIgnoringExceptions(unserialize($t));
+            ForkJoinTask::cancelIgnoringExceptions($t);
         }
     }
 
     /**
      * Polls and runs tasks until empty.
      */
-    public function pollAndExecAll(): void
+    public function pollAndExecAll(?ThreadInterface $worker = null): void
     {
         while (($t = $this->poll()) !== null) {
-            $t->doExec();
+            $t->doExec($worker);
         }
     }
 
@@ -257,15 +283,15 @@ class ForkJoinWorkQueue
      * pollAndExecAll. Otherwise implements a specialized pop loop
      * to exec until empty.
      */
-    public function execLocalTasks(): void
+    public function execLocalTasks(?ThreadInterface $worker = null): void
     {
         if (!$this->isEmpty()) {
-            if (($this->config & ForkJoinPoolExecutor::FIFO_QUEUE) == 0) {
+            if (($this->config & ForkJoinPool::FIFO_QUEUE) === 0) {
                 while (($t = $this->pop()) !== null) {
-                    $t->doExec();
+                    $t->doExec($worker);
                 }
             } else {
-                $this->pollAndExecAll();
+                $this->pollAndExecAll($worker);
             }
         }
     }
@@ -273,19 +299,19 @@ class ForkJoinWorkQueue
     /**
      * Executes the given task and any remaining local tasks.
      */
-    public function runTask(?ForkJoinTask $task): void
+    public function runTask(?ForkJoinTask $task, ThreadInterface $worker, ...$args): void
     {
         if ($task !== null) {
-            $this->scanState &= ~ForkJoinPoolExecutor::SCANNING; // mark as busy
-            $this->currentSteal->set('task', serialize($task));
-            $task->doExec();
+            $this->scanState->set($this->scanState->get() & ~ForkJoinPool::SCANNING); // mark as busy
+            $this->currentSteal->set('task', ['task' => serialize($task)]);
+            $task->doExec($worker, ...$args);
             $this->currentSteal->del('task');
-            $this->execLocalTasks();
+            $this->execLocalTasks($worker);
             $thread = $this->owner;
             if (++$this->nsteals < 0) { // collect on overflow
                 $this->transferStealCount($this->pool);
             }
-            $this->scanState |= ForkJoinPoolExecutor::SCANNING;
+            $this->scanState->set($this->scanState->get() | ForkJoinPool::SCANNING);
             if ($thread != null) {
                 $thread->afterTopLevelExec();
             }
@@ -295,7 +321,7 @@ class ForkJoinWorkQueue
     /**
      * Adds steal count to pool stealCounter if it exists, and resets.
      */
-    public function transferStealCount(?ForkJoinPoolExecutor $p): void
+    public function transferStealCount(?ForkJoinPool $p): void
     {
         if ($p != null && $this->stealCounter->get() !== 0) {
             $s = $this->nsteals;
@@ -310,7 +336,7 @@ class ForkJoinWorkQueue
      *
      * @return true if queue empty and task not known to be done
      */
-    public function tryRemoveAndExec(?ForkJoinTask $task): bool
+    public function tryRemoveAndExec(?ForkJoinTask $task, ?ThreadInterface $worker = null): bool
     {
         if ($this->isEmpty()) {
             return true;
@@ -334,7 +360,7 @@ class ForkJoinWorkQueue
                     $removed = true;
                 }
                 if ($removed) {
-                    $task->doExec();
+                    $task->doExec($worker);
                 }
                 break;
             } elseif ($t->status < 0 && $i == 1) {

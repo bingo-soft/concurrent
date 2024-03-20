@@ -6,7 +6,7 @@ use Concurrent\Lock\LockSupport;
 
 trait NotificationTrait
 {
-    public function listen(int $port): void
+    public function listen(int $port = 1081): void
     {
         LockSupport::init($port);
     }

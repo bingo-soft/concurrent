@@ -6,9 +6,9 @@ use Concurrent\ThreadInterface;
 
 interface NotificationInterface
 {
-    public function await(ThreadInterface $thread, ?int $time = null, ?string $unit = null);
+    public function await(?ThreadInterface $thread = null, ?int $time = null, ?string $unit = null);
 
-    public function notify(ThreadInterface $thread): void;
+    public function notify(?ThreadInterface $thread = null): void;
 
-    public function notifyAll(ThreadInterface $thread): void;
+    public function notifyAll(?ThreadInterface $thread = null): void;
 }

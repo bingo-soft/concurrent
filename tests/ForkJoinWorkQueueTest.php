@@ -4,12 +4,12 @@ namespace Tests;
 
 use PHPUnit\Framework\TestCase;
 use Concurrent\Queue\ForkJoinWorkQueue;
-use Concurrent\Executor\ForkJoinPoolExecutor;
+//use Concurrent\Executor\ForkJoinPool;
 use Concurrent\Lock\{
     LockSupport,
     ReentrantLockNotification
 };
-use Concurrent\Task\ForkJoinTask;
+use Concurrent\Task\AdaptedCallable;
 use Concurrent\Worker\InterruptibleProcess;
 use Swoole\Coroutine\Channel;
 
@@ -21,13 +21,26 @@ class ForkJoinWorkQueueTest extends TestCase
 
     public function testMethods(): void
     {
-        $pool = new ForkJoinPoolExecutor();
-        $t1 = new ForkJoinTask();
-        $t2 = new ForkJoinTask();
-        $t3 = new ForkJoinTask();
-        $t4 = new ForkJoinTask();
-        $t5 = new ForkJoinTask();
-        $t6 = new ForkJoinTask();
+        /*
+        //$pool = new ForkJoinPool();
+        $t1 = new AdaptedCallable(function () {
+            fwrite(STDERR, "===adapted callable called (1) ===\n");
+        });
+        $t2 = new AdaptedCallable(function () {
+            fwrite(STDERR, "===adapted callable called (2) ===\n");
+        });
+        $t3 = new AdaptedCallable(function () {
+            fwrite(STDERR, "===adapted callable called (3) ===\n");
+        });
+        $t4 = new AdaptedCallable(function () {
+            fwrite(STDERR, "===adapted callable called (4) ===\n");
+        });
+        $t5 = new AdaptedCallable(function () {
+            fwrite(STDERR, "===adapted callable called (5) ===\n");
+        });
+        $t6 = new AdaptedCallable(function () {
+            fwrite(STDERR, "===adapted callable called (6) ===\n");
+        });
 
         $queue = new ForkJoinWorkQueue(null, null, 5);
         $queue->push($t1);
@@ -104,13 +117,13 @@ class ForkJoinWorkQueueTest extends TestCase
 
         $p = new InterruptibleProcess(function ($process) {
             fwrite(STDERR, "Start process " . $process->pid . "\n");
-            LockSupport::park($process);         
+            LockSupport::park();         
             fwrite(STDERR, "Process " . $process->pid . " ended\n");
         });
         $p->start();
         $p2 = new InterruptibleProcess(function ($process) use ($lock) {
             fwrite(STDERR, "Start process " . $process->pid . "\n");
-            LockSupport::park($process);         
+            LockSupport::park();         
             fwrite(STDERR, "Process " . $process->pid . " ended\n");
         });
         $p2->start();
@@ -120,22 +133,7 @@ class ForkJoinWorkQueueTest extends TestCase
         LockSupport::unpark($p2->pid);
         LockSupport::unpark($p->pid);
         $p->wait();
-        $p2->wait();
-
-
+        $p2->wait();*/
         
-        /*$p3 = new InterruptibleProcess(function ($process) use ($lock) {
-            fwrite(STDERR, "Start process " . $process->pid . " and return from park immediately\n");
-            //$lock->wait(0);
-            //$read = $process->read();
-            //$read = $process->pop();
-            LockSupport::park($process);         
-            fwrite(STDERR, "Process " . $process->pid . " ended\n");
-        });
-        $p3->start();
-        fwrite(STDERR, "Unpark before parking\n");
-        LockSupport::unpark($p3->pid);
-        fwrite(STDERR, "Wait process to end\n");
-        $p3->wait();*/
     }    
 }

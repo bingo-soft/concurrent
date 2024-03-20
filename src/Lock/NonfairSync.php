@@ -4,13 +4,13 @@ namespace Concurrent\Lock;
 
 use Concurrent\ThreadInterface;
 
-class NonfairSync extends Sync
+class NonfairSync extends ReentrantLockSync
 {
     /**
      * Performs lock.  Try immediate barge, backing up to normal
      * acquire on failure.
      */
-    public function lock(ThreadInterface $thread): void
+    public function lock(?ThreadInterface $thread = null): void
     {
         if ($this->compareAndSetState(0, 1)) {
             $this->setExclusiveOwnerThread($thread);
@@ -19,7 +19,7 @@ class NonfairSync extends Sync
         }
     }
 
-    public function acquire(ThreadInterface $thread, int $acquires)
+    public function acquire(?ThreadInterface $thread = null, int $acquires = 0)
     {
         return $this->nonfairTryAcquire($thread, $acquires);
     }

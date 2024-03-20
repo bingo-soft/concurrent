@@ -10,5 +10,5 @@ interface ExecutorServiceInterface extends ExecutorInterface
 
     public function isTerminated(): bool;
 
-    public function awaitTermination(int $timeout, string $unit);
+    public function awaitTermination(ThreadInterface $thread, int $timeout, string $unit);
 }

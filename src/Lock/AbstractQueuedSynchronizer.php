@@ -39,7 +39,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         $this->head = new \Swoole\Atomic\Long(-1);
         $this->tail = new \Swoole\Atomic\Long(-1);
 
-        $queue = new \Swoole\Table(128);
+        $queue = new \Swoole\Table(128); // 128 -> alloc(): mmap(21264) failed, Error: Too many open files in system[23]
         $queue->column('next', \Swoole\Table::TYPE_INT, 8);
         $queue->column('prev', \Swoole\Table::TYPE_INT, 8);
         $queue->column('pid', \Swoole\Table::TYPE_INT, 8);
@@ -117,20 +117,15 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                 if ($this->initHead()) {
                     $this->queue->set((string) $this->head->get(), ['next' => -1, 'prev' => -1, 'pid' => 0, 'nextWaiter' =>  -1, 'waitStatus' => 0]);
                     $this->tail->set($this->head->get());
-                    //fwrite(STDERR, $node['pid'] . ": Dummy head and tail initiated\n");
                 }
             } else {
                 $pid = $node['pid'];                
                 $node['prev'] = $t;
                 $this->queue->set((string) $pid, $node);
-
-                //fwrite(STDERR, $pid . ": Enqueue node (1): " . json_encode($node) . "\n");
-
                 if ($this->compareAndSetTail($t, $node['pid'])) {
                     $tailData = $this->queue->get((string) $t);
                     $tailData['next'] = $pid;
                     $this->queue->set((string) $t, $tailData);
-                    //fwrite(STDERR, $t . ": Enqueue node (2): " . json_encode($tailData) . "\n");
                     return $t;
                 }
             }
@@ -142,26 +137,26 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *
      * @param mode 1 for exclusive, 2 for shared
      */
-    private function addWaiter(ThreadInterface $thread, int $mode)
+    private function addWaiter(?ThreadInterface $thread = null, int $mode)
     {
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         if ($mode == 1) {
-            $nData = ['next' => -1, 'prev' => -1, 'pid' => $thread->pid, 'nextWaiter' => -1, 'waitStatus' => 0];
+            $nData = ['next' => -1, 'prev' => -1, 'pid' => $pid, 'nextWaiter' => -1, 'waitStatus' => 0];
         } else {
-            $nData = ['next' => -1, 'prev' => -1, 'pid' => $thread->pid, 'nextWaiter' => 0, 'waitStatus' => 0];
+            $nData = ['next' => -1, 'prev' => -1, 'pid' => $pid, 'nextWaiter' => 0, 'waitStatus' => 0];
         }
-        $this->queue->set((string) $thread->pid, $nData);
+        $this->queue->set((string) $pid, $nData);
         // Try the fast path of enq; backup to full enq on failure
         $pred = $this->tail;
         if ($pred->get() !== -1) {
             $nData['prev'] = $pred->get();
-            if ($this->compareAndSetTail($pred->get(), $thread->pid)) {
+            if ($this->compareAndSetTail($pred->get(), $pid)) {
                 $predData = $this->queue->get((string) $pred->get());
-                $predData['next'] = $thread->pid;
+                $predData['next'] = $pid;
                 $this->queue->set((string) $pred->get(), $predData);
                 return $nData;
             }
         }
-        //fwrite(STDERR, $thread->pid . ": Call addWaiter, move node to sync queue, node: " . json_encode($nData) . "\n");
         $this->enq($nData);
         return $nData;
     }
@@ -207,7 +202,6 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
          */
         $nData = $this->queue->get((string) $node);
         $ws = $nData['waitStatus'];
-        //fwrite(STDERR, "$node: Will try to unpark successor, waitStatus $ws\n");
         if ($ws < 0) {
             $this->compareAndSetWaitStatus($nData, $ws, 0);
         }
@@ -230,7 +224,6 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             }
         }
         if ($s !== null) {
-            //fwrite(STDERR, "$node: Actual unpark will take place here, thread to be unparked id $s\n");
             LockSupport::unpark($s);
         }
     }
@@ -401,7 +394,6 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         $pData = $this->queue->get((string) $pred);
         $nData = $this->queue->get((string) $node);
         $ws = $pData['waitStatus'];
-        //fwrite(STDERR, $node . ": Call of shouldParkAfterFailedAcquire happening, prev node: " . json_encode($pData) . ", cur node: " . json_encode($nData) . "\n");
         if ($ws == Node::SIGNAL) {
             /*
              * This node has already set status asking a release
@@ -436,7 +428,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     /**
      * Convenience method to interrupt current thread.
      */
-    public static function selfInterrupt(ThreadInterface $thread): void
+    public static function selfInterrupt(?ThreadInterface $thread = null): void
     {
         $thread->interrupt();
     }
@@ -446,11 +438,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *
      * @return {@code true} if interrupted
      */
-    private function parkAndCheckInterrupt(ThreadInterface $thread): bool
+    private function parkAndCheckInterrupt(?ThreadInterface $thread = null): bool
     {
-        //fwrite(STDERR, $thread->pid . ": Call  parkAndCheckInterrupt trying to park thread again\n");
         LockSupport::park($thread/*, $this*/);
-        return $thread->isInterrupted();
+        return $thread !== null ? $thread->isInterrupted() : false;
     }
 
     /*
@@ -470,34 +461,27 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param arg the acquire argument
      * @return {@code true} if interrupted while waiting
      */
-    public function acquireQueued(ThreadInterface $thread, array $node, int $arg): bool
+    public function acquireQueued(?ThreadInterface $thread = null, array $node = [], int $arg = 0): bool
     {
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             $interrupted = false;
             for (;;) {
-                $predData = $this->queue->get((string) $thread->pid);
+                $predData = $this->queue->get((string) $pid);
                 $p = $predData['prev'];
-                //fwrite(STDERR, $thread->pid . ": Predecessor " . json_encode($predData) . ", head: " . $this->head->get() . ", prev: $p " . json_encode($node) . "\n");
                 if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($thread->pid);                   
-
-                    //$pData = $this->queue->get((string) $p);
-                    //$pData['next'] = -1;
-                    //$this->queue->set((string) $p, $pData);
-                    
-                    //fwrite(STDERR, $thread->pid . ": Head after acquireQueued: " . json_encode($this->queue->get((string) $this->head->get())) . "\n");
-                    //fwrite(STDERR, $thread->pid . ": Tail after acquireQueued: " . json_encode($this->queue->get((string) $this->tail->get())) . "\n");
+                    $this->setHead($pid);
                     $failed = false;
                     return $interrupted;
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
                     $interrupted = true;
                 }
             }
         } finally {
             if ($failed) {
-                $this->cancelAcquire($thread->pid);
+                $this->cancelAcquire($pid);
             }
         }
     }
@@ -506,29 +490,30 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * Acquires in exclusive interruptible mode.
      * @param arg the acquire argument
      */
-    private function doAcquireInterruptibly(ThreadInterface $thread, int $arg): void
+    private function doAcquireInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
     {
         $this->addWaiter($thread, 1);
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             for (;;) {
-                $nData = $this->queue->get((string) $thread->pid);  
+                $nData = $this->queue->get((string) $pid);  
                 $p = $nData['prev'];
                 if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($thread->pid);
+                    $this->setHead($pid);
                     //$pData = $this->queue->get((string) $p);
                     //$pData['next'] = -1;
                     //$this->queue->set((string) $p, $pData);  
                     $failed = false;                    
                     return;
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
                     throw new \Exception("Interrupted");
                 }
             }
         } finally {
             if ($failed) {
-                $this->cancelAcquire($thread->pid);
+                $this->cancelAcquire($pid);
             }
         }
     }
@@ -540,7 +525,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param nanosTimeout max wait time
      * @return {@code true} if acquired
      */
-    private function doAcquireNanos(ThreadInterface $thread, int $arg, int $nanosTimeout): bool
+    private function doAcquireNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
     {
         if ($nanosTimeout <= 0) {
             return false;
@@ -548,12 +533,13 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
         $this->addWaiter($thread, 1);
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             for (;;) {
-                $nData = $this->queue->get((string) $thread->pid);  
+                $nData = $this->queue->get((string) $pid);  
                 $p = $nData['prev'];
                 if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($thread->pid);
+                    $this->setHead($pid);
                     //$pData = $this->queue->get((string) $p);
                     //$pData['next'] = -1;
                     //$this->queue->set((string) $p, $pData);
@@ -564,7 +550,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                 if ($nanosTimeout <= 0) {
                     return false;
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) &&
+                if ($this->shouldParkAfterFailedAcquire($p, $pid) &&
                     $nanosTimeout > self::$spinForTimeoutThreshold) {
                     LockSupport::parkNanos($thread, $this, $nanosTimeout);
                 }
@@ -574,7 +560,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             }
         } finally {
             if ($failed) {
-                $this->cancelAcquire($thread->pid);
+                $this->cancelAcquire($pid);
             }
         }
     }
@@ -583,19 +569,20 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * Acquires in shared uninterruptible mode.
      * @param arg the acquire argument
      */
-    private function doAcquireShared(ThreadInterface $thread, int $arg): void
+    private function doAcquireShared(?ThreadInterface $thread = null, int $arg = 0): void
     {
         $this->addWaiter($thread, 2);
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             $interrupted = false;
             for (;;) {
-                $nData = $this->queue->get((string) $thread->pid);  
+                $nData = $this->queue->get((string) $pid);  
                 $p = $nData['prev'];
                 if ($p == $this->head->get()) {
                     $r = $this->tryAcquireShared($thread, $arg);
                     if ($r >= 0) {
-                        $this->setHeadAndPropagate($thread->pid, $r);
+                        $this->setHeadAndPropagate($pid, $r);
                         $pData = $this->queue->get((string) $p);
                         $pData['next'] = -1;
                         $this->queue->set((string) $p, $pData);
@@ -607,13 +594,13 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                         return;
                     }
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
                     $interrupted = true;
                 }
             }
         } finally {
             if ($failed) {
-                $this->cancelAcquire($thread->pid);
+                $this->cancelAcquire($pid);
             }
         }
     }
@@ -622,18 +609,19 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * Acquires in shared interruptible mode.
      * @param arg the acquire argument
      */
-    private function doAcquireSharedInterruptibly(ThreadInterface $thread, int $arg): void
+    private function doAcquireSharedInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
     {
         $this->addWaiter($thread, 2);
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             for (;;) {
-                $nData = $this->queue->get((string) $thread->pid);  
+                $nData = $this->queue->get((string) $pid);  
                 $p = $nData['prev'];
                 if ($p == $this->head->get()) {
                     $r = $this->tryAcquireShared($thread, $arg);
                     if ($r >= 0) {
-                        $this->setHeadAndPropagate($thread->pid, $r);
+                        $this->setHeadAndPropagate($pid, $r);
                         $pData = $this->queue->get((string) $p);
                         $pData['next'] = -1;
                         $this->queue->set((string) $p, $pData);
@@ -642,13 +630,13 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                         return;
                     }
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) && $this->parkAndCheckInterrupt($thread)) {
+                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
                     throw new \Exception("Interrupted");
                 }
             }
         } finally {
             if ($failed) {
-                $this->cancelAcquire($thread->pid);
+                $this->cancelAcquire($pid);
             }
         }
     }
@@ -660,7 +648,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param nanosTimeout max wait time
      * @return {@code true} if acquired
      */
-    private function doAcquireSharedNanos(ThreadInterface $thread, int $arg, int $nanosTimeout): bool
+    private function doAcquireSharedNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
     {
         if ($nanosTimeout <= 0) {
             return false;
@@ -668,14 +656,15 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
         $this->addWaiter($thread, 2);
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             for (;;) {
-                $nData = $this->queue->get((string) $thread->pid);  
+                $nData = $this->queue->get((string) $pid);  
                 $p = $nData['prev'];
                 if ($p == $this->head->get()) {
                     $r = $this->tryAcquireShared($thread, $arg);
                     if ($r >= 0) {
-                        $this->setHeadAndPropagate($thread->pid, $r);
+                        $this->setHeadAndPropagate($pid, $r);
                         $pData = $this->queue->get((string) $p);
                         $pData['next'] = -1;
                         $this->queue->set((string) $p, $pData);
@@ -688,7 +677,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
                 if ($nanosTimeout <= 0) {
                     return false;
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $thread->pid) &&
+                if ($this->shouldParkAfterFailedAcquire($p, $pid) &&
                     $nanosTimeout > self::$spinForTimeoutThreshold) {
                     LockSupport::parkNanos($thread, $this, $nanosTimeout);
                 }
@@ -698,7 +687,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             }
         } finally {
             if ($failed) {
-                $this->cancelAcquire($thread->pid);
+                $this->cancelAcquire($pid);
             }
         }
     }
@@ -731,7 +720,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         correctly.
      * @throws UnsupportedOperationException if exclusive mode is not supported
      */
-    public function tryAcquire(ThreadInterface $thread, int $arg): bool
+    public function tryAcquire(?ThreadInterface $thread = null, int $arg = 0): bool
     {
         throw new \Exception("UnsupportedOperation");
     }
@@ -758,7 +747,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         correctly.
      * @throws UnsupportedOperationException if exclusive mode is not supported
      */
-    public function tryRelease(ThreadInterface $thread, int $arg): bool
+    public function tryRelease(?ThreadInterface $thread = null, int $arg = 0): bool
     {
         throw new \Exception("Unsupported operation");
     }
@@ -795,7 +784,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         correctly.
      * @throws UnsupportedOperationException if shared mode is not supported
      */
-    public function tryAcquireShared(ThreadInterface $thread, int $arg): int
+    public function tryAcquireShared(?ThreadInterface $thread = null, int $arg = 0): int
     {
         throw new \Exception("Unsupported operation");
     }
@@ -821,7 +810,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         correctly.
      * @throws UnsupportedOperationException if shared mode is not supported
      */
-    public function tryReleaseShared(ThreadInterface $thread, int $arg): bool
+    public function tryReleaseShared(?ThreadInterface $thread = null, int $arg = 0): bool
     {
         throw new \Exception("Unsupported operation");
     }
@@ -841,7 +830,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         {@code false} otherwise
      * @throws UnsupportedOperationException if conditions are not supported
      */
-    public function isHeldExclusively(ThreadInterface $thread): bool
+    public function isHeldExclusively(?ThreadInterface $thread = null): bool
     {
         throw new UnsupportedOperationException();
     }
@@ -858,14 +847,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        {@link #tryAcquire} but is otherwise uninterpreted and
      *        can represent anything you like.
      */
-    public function acquire(ThreadInterface $thread, int $arg)
+    public function acquire(?ThreadInterface $thread = null, int $arg = 0)
     {
         if (!$this->tryAcquire($thread, $arg)) {
-            //fwrite(STDERR, $thread->pid . ": Acquire failed, call addWaiter\n");
             $node = $this->addWaiter($thread, 1);
-            //fwrite(STDERR, $thread->pid . ": Node after addWaiter: " . json_encode($node). "\n");
-            //fwrite(STDERR, $thread->pid . ": Head after addWaiter: " . json_encode($this->queue->get((string) $this->head->get())). "\n");
-            //fwrite(STDERR, $thread->pid . ": Tail after addWaiter: " . json_encode($this->queue->get((string) $this->tail->get())). "\n");
             if ($this->acquireQueued($thread, $node, $arg)) {
                 self::selfInterrupt($thread);
             }
@@ -886,7 +871,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        can represent anything you like.
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function acquireInterruptibly(ThreadInterface $thread, int $arg): void
+    public function acquireInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
     {
         if ($thread->isInterrupted())
             throw new \Exception("Interrupted");
@@ -912,7 +897,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @return {@code true} if acquired; {@code false} if timed out
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function tryAcquireNanos(ThreadInterface $thread, int $arg, int $nanosTimeout): bool
+    public function tryAcquireNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
     {
         if ($thread->isInterrupted()) {
             throw new \Exception("Interrupted");
@@ -931,18 +916,14 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        can represent anything you like.
      * @return the value returned from {@link #tryRelease}
      */
-    public function release(ThreadInterface $thread, int $arg): bool
+    public function release(?ThreadInterface $thread = null, int $arg = 0): bool
     {
-        //fwrite(STDERR, $thread->pid . ": Call release\n");
         if ($this->tryRelease($thread, $arg)) {
             $h = $this->head;
             $hData = $h->get() !== -1 ? $this->queue->get((string) $h->get()) : false;
-            //fwrite(STDERR, $thread->pid . ": Try release is successfull, head: " . $h->get(). ", headData: " . json_encode($hData) . "\n");
             if ($hData !== false && $hData['waitStatus'] !== 0) {
-                //fwrite(STDERR, $thread->pid . ": Will release and unpark successor of node: " . json_encode($hData) . "\n");
                 $this->unparkSuccessor($h->get());                
             }
-            //fwrite(STDERR, $thread->pid . ": Thread released the lock\n");
             return true;
         }
         return false;
@@ -959,7 +940,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        {@link #tryAcquireShared} but is otherwise uninterpreted
      *        and can represent anything you like.
      */
-    public function acquireShared(ThreadInterface $thread, int $arg): void
+    public function acquireShared(?ThreadInterface $thread = null, int $arg = 0): void
     {
         if ($this->tryAcquireShared($thread, $arg) < 0) {
             $this->doAcquireShared($thread, $arg);
@@ -979,9 +960,9 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * you like.
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function acquireSharedInterruptibly(ThreadInterface $thread, int $arg): void
+    public function acquireSharedInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
     {
-        if ($thread->isInterrupted()) {
+        if ($thread !== null && $thread->isInterrupted()) {
             throw new \Exception("Interrupted");
         }
         if ($this->tryAcquireShared($thread, $arg) < 0) {
@@ -1005,7 +986,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @return {@code true} if acquired; {@code false} if timed out
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function tryAcquireSharedNanos(ThreadInterface $thread, int $arg, int $nanosTimeout): bool
+    public function tryAcquireSharedNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
     {
         if ($thread->isInterrupted()) {
             throw new \Exception("Interrupted");
@@ -1023,7 +1004,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        and can represent anything you like.
      * @return the value returned from {@link #tryReleaseShared}
      */
-    public function releaseShared(ThreadInterface $thread, int $arg): bool
+    public function releaseShared(?ThreadInterface $thread = null, int $arg = 0): bool
     {
         if ($this->tryReleaseShared($thread, $arg)) {
             $this->doReleaseShared();
@@ -1130,12 +1111,13 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @return {@code true} if the given thread is on the queue
      * @throws NullPointerException if the thread is null
      */
-    public function isQueued(ThreadInterface $thread): bool
+    public function isQueued(?ThreadInterface $thread = null): bool
     {
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         if ($this->tail->get() !== -1) {
             for ($p = $this->tail->get(); $p !== 0; ) {
                 $pData = $this->queue->get((string) $p);
-                if ($pData['pid'] == $thread->pid) {
+                if ($pData['pid'] == $pid) {
                     return true;
                 }
                 $p = $pData['prev'];
@@ -1206,20 +1188,21 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         is at the head of the queue or the queue is empty
      * @since 1.7
      */
-    public function hasQueuedPredecessors(ThreadInterface $thread): bool
+    public function hasQueuedPredecessors(?ThreadInterface $thread = null): bool
     {
         // The correctness of this depends on head being initialized
         // before tail and on head.next being accurate if the current
         // thread is first in queue.
         $t = $this->tail; // Read fields in reverse initialization order
         $h = $this->head;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         return $h->get() != $t->get() &&
               (($hData = $this->queue->get((string) $h->get())) !== false) && 
                (
                     ($s = $hData['next']) === 0 || 
                     ( 
                         (($sData = $this->queue->get((string) $s)) !== false) &&
-                        $sData['pid'] !== $thread->pid
+                        $sData['pid'] !== $pid
                     )
                 );
     }
@@ -1355,12 +1338,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     {
         //When Node() is predicessor, then $nData['prev'] === 0, but it is not null
         $nData = $this->queue->get((string) $node);
-        //fwrite(STDERR, $nData['pid'] . ": Check isOnSyncQueue of node " . json_encode($nData) . "\n");
         if ($nData === false || $nData['waitStatus'] == Node::CONDITION || $nData['prev'] === -1) {
             return false;
         }
         if ($nData['next'] !== -1) {// If has successor, it must be on queue
-            //fwrite(STDERR, $nData['pid'] . ": Call isOnSyncQueue and return true for node " . json_encode($nData) . "\n");
             return true;
         }
         /*
@@ -1383,7 +1364,6 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     {
         if ($this->tail->get() !== -1) {
             $t = $this->tail->get();
-            //fwrite(STDERR, $node['pid'] . ": Call findNodeFromTail, compare nodes: " . json_encode($this->queue->get((string) $t)) . " and " . json_encode($node) . "\n" );
             for (;;) {
                 if ($t === $node['pid']) {
                     return true;
@@ -1462,9 +1442,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param thread to be released
      * @return previous sync state
      */
-    public function fullyRelease(ThreadInterface $thread): int
+    public function fullyRelease(?ThreadInterface $thread = null): int
     {
         $failed = true;
+        $pid = $thread !== null ? $thread->getPid() : getmypid();
         try {
             $savedState = $this->getState();
             if ($this->release($thread, $savedState)) {
@@ -1475,7 +1456,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
             }
         } finally {
             if ($failed) {
-                $nodeData = $this->queue->get((string) $thread->pid);
+                $nodeData = $this->queue->get((string) $pid);
                 $nodeData['waitStatus'] = Node::CANCELLED;
             }
         }
@@ -1588,17 +1569,6 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
 
     private function compareAndSetWaitStatus(array &$node, int $expect, int $update): bool
     {
-        /*$from = [];
-        $ex = new \Exception();
-        for ($i = 0; $i < 10; $i += 1) {
-            try {
-                $t = $ex->getTrace()[$i];
-                $from[] = sprintf("%s.%s.%s", $t['file'], $t['function'], $t['line']);
-            } catch (\Throwable $tt) {
-            }
-        }*/
-
-        //fwrite(STDERR, $node['pid'] . ": Call compareAndSetWaitStatus on node: " . json_encode($node) .", sync node: " . json_encode($this->queue->get((string) $node['pid'])) . "\n");
         if ($node['waitStatus'] == $expect) {
             $node['waitStatus'] = $update;
             $this->queue->set((string) $node['pid'], $node);

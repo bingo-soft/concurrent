@@ -40,7 +40,7 @@ interface ConditionInterface
      * thrown (such as {@link IllegalMonitorStateException}) and the
      * implementation must document that fact.
      */
-    public function awaitUninterruptibly(ThreadInterface $thread): void;
+    public function awaitUninterruptibly(?ThreadInterface $thread = null): void;
 
     /**
      * Causes the current thread to wait until it is signalled or interrupted,
@@ -131,7 +131,7 @@ interface ConditionInterface
      * @throws InterruptedException if the current thread is interrupted
      *         (and interruption of thread suspension is supported)
      */
-    public function awaitNanos(ThreadInterface $thread, int $nanosTimeout): int;
+    public function awaitNanos(?ThreadInterface $thread = null, int $nanosTimeout = 0): int;
 
     /**
      * Causes the current thread to wait until it is signalled or interrupted,
@@ -146,7 +146,7 @@ interface ConditionInterface
      * @throws InterruptedException if the current thread is interrupted
      *         (and interruption of thread suspension is supported)
      */
-    public function await(ThreadInterface $thread, ?int $time = null, ?string $unit = null);
+    public function await(?ThreadInterface $thread = null, ?int $time = null, ?string $unit = null);
 
     /**
      * Causes the current thread to wait until it is signalled or interrupted,
@@ -223,7 +223,7 @@ interface ConditionInterface
      * @throws InterruptedException if the current thread is interrupted
      *         (and interruption of thread suspension is supported)
      */
-    public function awaitUntil(ThreadInterface $thread, \DateTime $deadline): bool;
+    public function awaitUntil(?ThreadInterface $thread = null, \DateTime $deadline = null): bool;
 
     /**
      * Wakes up one waiting thread.
@@ -241,7 +241,7 @@ interface ConditionInterface
      * not held. Typically, an exception such as {@link
      * IllegalMonitorStateException} will be thrown.
      */
-    public function signal(ThreadInterface $thread): void;
+    public function signal(?ThreadInterface $thread = null): void;
 
     /**
      * Wakes up all waiting threads.
@@ -259,5 +259,5 @@ interface ConditionInterface
      * not held. Typically, an exception such as {@link
      * IllegalMonitorStateException} will be thrown.
      */
-    public function signalAll(ThreadInterface $thread): void;
+    public function signalAll(?ThreadInterface $thread = null): void;
 }

@@ -25,7 +25,7 @@ abstract class AbstractOwnableSynchronizer implements SynchronizerInterface
      * {@code volatile} field accesses.
      * @param thread the owner thread
      */
-    protected function setExclusiveOwnerThread(?ThreadInterface $thread): void
+    protected function setExclusiveOwnerThread(?ThreadInterface $thread = null): void
     {
         $this->exclusiveOwnerThread = $thread;
     }

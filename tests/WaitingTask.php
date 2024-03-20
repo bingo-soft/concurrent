@@ -39,7 +39,7 @@ class WaitingTask implements RunnableInterface
     public function run(ThreadInterface $process = null, ...$args): void
     {
         fwrite(STDERR, $process->pid . ": Waiting for the signal.\n");
-        $this->notification->await($process);
+        $this->notification->await(/*$process*/);
         fwrite(STDERR, $process->pid . ": Received the signal and running again.\n");
     }
 }

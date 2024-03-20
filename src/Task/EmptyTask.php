@@ -2,6 +2,8 @@
 
 namespace Concurrent\Task;
 
+use Concurrent\ThreadInterface;
+
 class EmptyTask extends ForkJoinTask
 {
     public function __construct()
@@ -17,7 +19,7 @@ class EmptyTask extends ForkJoinTask
     {
     }
 
-    public function exec(): bool
+    public function exec(?ThreadInterface $thread, ...$args): bool
     {
         return true;
     }

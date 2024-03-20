@@ -52,4 +52,4 @@ To test core usage, you can edit `TestTask` - change value `2000` in `run` metho
 
 # Dependencies
 
-The library depends on [Swoole](https://openswoole.com/) extension
+The library depends on Swoole extension and on GMP extension - the last one for handling large numbers.

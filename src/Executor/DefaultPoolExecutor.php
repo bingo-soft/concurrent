@@ -395,7 +395,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
         }
     }
 
-    private function getTask(ThreadInterface $thread): ?RunnableInterface
+    private function getTask(?ThreadInterface $thread = null): ?RunnableInterface
     {
         $timedOut = false;
         for (;;) {
@@ -600,7 +600,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
         return self::runStateAtLeast($this->ctl->get(), self::TERMINATED);
     }
 
-    public function awaitTermination(int $timeout, string $unit)
+    public function awaitTermination(ThreadInterface $thread, int $timeout, string $unit)
     {
         $nanos = TimeUnit::toNanos($timeout, $unit);
         $this->mainLock->trylock();
@@ -629,6 +629,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
     {
     }
 
+    //@TODO - move to trait
     public function setScopeArguments(...$args)
     {
         $this->scopeArguments = $args;

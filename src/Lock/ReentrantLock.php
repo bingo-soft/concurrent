@@ -37,7 +37,7 @@ class ReentrantLock implements LockInterface
      * purposes and lies dormant until the lock has been acquired,
      * at which time the lock hold count is set to one.
      */
-    public function lock(ThreadInterface $thread): void
+    public function lock(?ThreadInterface $thread = null): void
     {
         $this->sync->lock($thread);
     }
@@ -88,7 +88,7 @@ class ReentrantLock implements LockInterface
      *
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function lockInterruptibly(ThreadInterface $thread): void
+    public function lockInterruptibly(?ThreadInterface $thread = null): void
     {
         $this->sync->acquireInterruptibly($thread, 1);
     }
@@ -185,7 +185,7 @@ class ReentrantLock implements LockInterface
      * @throws IllegalMonitorStateException if the current thread does not
      *         hold this lock
      */
-    public function unlock(ThreadInterface $thread): void
+    public function unlock(?ThreadInterface $thread = null): void
     {
         $this->sync->release($thread, 1);
     }
@@ -263,7 +263,7 @@ class ReentrantLock implements LockInterface
      * @return the number of holds on this lock by the current thread,
      *         or zero if this lock is not held by the current thread
      */
-    public function getHoldCount(ThreadInterface $thread): int
+    public function getHoldCount(?ThreadInterface $thread = null): int
     {
         return $this->sync->getHoldCount($thread);
     }
@@ -309,7 +309,7 @@ class ReentrantLock implements LockInterface
      * @return {@code true} if current thread holds this lock and
      *         {@code false} otherwise
      */
-    public function isHeldByCurrentThread(ThreadInterface $thread): bool
+    public function isHeldByCurrentThread(?ThreadInterface $thread = null): bool
     {
         return $this->sync->isHeldExclusively($thread);
     }
@@ -381,7 +381,7 @@ class ReentrantLock implements LockInterface
      * @return {@code true} if the given thread is queued waiting for this lock
      * @throws NullPointerException if the thread is null
      */
-    public function hasQueuedThread(ThreadInterface $thread): bool
+    public function hasQueuedThread(?ThreadInterface $thread = null): bool
     {
         return $this->sync->isQueued($thread);
     }
