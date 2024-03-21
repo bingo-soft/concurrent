@@ -200,7 +200,7 @@ class ConditionObject implements ConditionInterface
         $savedState = $this->synchronizer->fullyRelease($thread);
         $interrupted = false;
         $pid = $thread !== null ? $thread->pid : getmypid();
-        while (!$this->synchronizer->isOnSyncQueue($pid, $node)) {
+        while (!$this->synchronizer->isOnSyncQueue($pid)) {
             LockSupport::park($thread);
             if ($thread->isInterrupted()) {
                 $interrupted = true;
@@ -272,7 +272,7 @@ class ConditionObject implements ConditionInterface
         $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
         $interruptMode = 0;
         $pid = $thread !== null ? $thread->pid : getmypid();
-        while (!$this->synchronizer->isOnSyncQueue($pid, $node)) {
+        while (!$this->synchronizer->isOnSyncQueue($pid)) {
             if ($nanosTimeout <= 0) {
                 $tData = $this->queue->get((string) $pid);
                 $this->synchronizer->transferAfterCancelledWait($tData);
@@ -325,7 +325,7 @@ class ConditionObject implements ConditionInterface
         $timedout = false;
         $interruptMode = 0;
         $pid = $thread !== null ? $thread->pid : getmypid();
-        while (!$this->synchronizer->isOnSyncQueue($pid, $node)) {
+        while (!$this->synchronizer->isOnSyncQueue($pid)) {
             if (time() > $abstime) {
                 $tData = $this->queue->get((string) $pid);
                 $timedout = $this->synchronizer->transferAfterCancelledWait($tData);
@@ -374,7 +374,7 @@ class ConditionObject implements ConditionInterface
             $node = $this->addConditionWaiter($thread);           
             $savedState = $this->synchronizer->fullyRelease($thread);
             $interruptMode = 0;
-            while (!$this->synchronizer->isOnSyncQueue($pid, $node)) {  
+            while (!$this->synchronizer->isOnSyncQueue($pid)) {  
                 LockSupport::park($thread/*, $this->synchronizer*/); 
                 if (($interruptMode = $this->checkInterruptWhileWaiting($thread)) != 0)
                     break;
@@ -400,7 +400,7 @@ class ConditionObject implements ConditionInterface
             $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
             $timedout = false;
             $interruptMode = 0;
-            while (!$this->synchronizer->isOnSyncQueue($pid, $node)) {
+            while (!$this->synchronizer->isOnSyncQueue($pid)) {
                 if ($nanosTimeout <= 0) {
                     $tData = $this->queue->get((string) $pid);
                     $timedout = $this->synchronizer->transferAfterCancelledWait($tData);

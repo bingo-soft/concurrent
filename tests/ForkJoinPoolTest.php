@@ -21,13 +21,11 @@ class ForkJoinPoolTest extends TestCase
 
     public function testMethods(): void
     {
-        //fwrite(STDERR, getmypid() . ": Test started\n");
         //$start = hrtime(true);
-        $notification = new ReentrantLockNotification(true);
-        $pool = ForkJoinPool::commonPool($notification);
+        $pool = ForkJoinPool::commonPool(/*$notification*/);
         $result = $pool->invoke(new SumTask(1, 300000));
         //$end = hrtime(true);
         //fwrite(STDERR, getmypid() . ": Result (concurrent) = $result, elapsed: " . ($end - $start) . "\n");
-        $this->assertEquals(45000150000, $result);        
+        $this->assertEquals(45000150000, $result);      
     }
 }

@@ -138,11 +138,8 @@ $pool->shutdown(); //shutdown pool with all processes attached
 
     // ===== Usage
 
-    //initialize inter process communication via server sockets, default port is 1081
-    $notification = new ReentrantLockNotification(true);
-
-    //Initialize pool
-    $pool = ForkJoinPool::commonPool($notification);
+    //Initialize pool, can reset default port of inter process communication
+    $pool = ForkJoinPool::commonPool(/*1081*/);
 
     //Invoke recursive task on pool
     $result = $pool->invoke(new SumTask(1, 300000));

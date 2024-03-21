@@ -52,7 +52,6 @@ class SumTask extends RecursiveTask
             for ($i = $this->start; $i <= $this->end; $i++) {
                 $sum += $i;
             }            
-            //fwrite(STDERR, getmypid() . ": Resulting sum is $sum of " . serialize($this) . "\n");
             return $sum;
         } else { // Recursive case
             $mid = $this->start + ($this->end - $this->start) / 2;
@@ -61,8 +60,7 @@ class SumTask extends RecursiveTask
             $leftTask->fork($worker); // Fork the first task  
             $firstHalf = $rightTask->compute($worker, ...$args);
             $secondHalf = $leftTask->join($worker, ...$args); // Join results
-            //fwrite(STDERR, getmypid() . ": return from recursive step sum of $firstHalf and $secondHalf\n");
-            return $firstHalf + $secondHalf;
+                return $firstHalf + $secondHalf;
         }
     }
 }

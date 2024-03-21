@@ -35,13 +35,28 @@ class ForkJoinPool implements ExecutorServiceInterface
 {
     use NotificationTrait;
     
-    // Constants shared across ForkJoinPool and WorkQueue
+    /**
+     * Default idle timeout value (in milliseconds) for idle threads
+     * to park waiting for new work before terminating.
+     */
+    public const DEFAULT_KEEPALIVE = 60000;
 
-    public const DEFAULT_NOTIFICATION_PORT = 1081;
+    /**
+     * Initial capacity of work-stealing queue array.  Must be a power
+     * of two, at least 2.
+     */
+    public const INITIAL_QUEUE_CAPACITY = 1 << 6;
 
-    // Bounds
+    // conversions among short, int, long
     public const SMASK        = 0xffff;        // short bits == max index
+    //public const LMASK        = 0xffffffff; // lower 32 bits of long
+    //public const UMASK        = ~LMASK;      // upper 32 bits
+
+    // masks and sentinels for queue indices
     public const MAX_CAP      = 0x7fff;        // max #workers - 1
+    public const EXTERNAL_ID_MASK = 0x3ffe;   // max external queue id
+    public const INVALID_ID       = 0x4000;   // unused external queue id
+
     public const EVENMASK     = 0xfffe;        // even short bits
     public const SQMASK       = 0x007e;        // max 64 (even) slots
 
@@ -56,7 +71,9 @@ class ForkJoinPool implements ExecutorServiceInterface
     public const FIFO_QUEUE   = 1 << 16;
     public const SHARED_QUEUE = -2147483648; //1 << 31;       // must be negative
 
+    //Inter process communication on sockets
     private static $notification;
+    private static $port;
     
     /**
      * Creates a new ForkJoinWorkerThread. This factory is used unless
@@ -272,6 +289,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                 }
             } elseif (($rs & self::STARTED) == 0 || $lock->get() === 0) {
                 //Thread.yield();   // initialization race
+                usleep(1);
             } elseif ($rs = $this->runState->get()) {
                 $this->runState->set($rs | self::RSIGNAL);
                 self::$mainLock->trylock();
@@ -1440,14 +1458,14 @@ class ForkJoinPool implements ExecutorServiceInterface
     public static $threadMeta;
 
     public function __construct(
-        NotificationInterface $notification,
+        ?int $port = 1081,
         ?int $parallelism = null,
         ?ForkJoinWorkerFactoryInterface $factory = null,
         $handler = null,
         ?int $mode = null,
         ?string $workerNamePrefix = null
     ) {
-        self::init($notification);
+        self::init($port);
         $this->runState = new \Swoole\Atomic\Long(0);
         $this->indexSeed = new \Swoole\Atomic\Long(0);
         $this->stealCounter = new \Swoole\Atomic(-1);       
@@ -1469,17 +1487,19 @@ class ForkJoinPool implements ExecutorServiceInterface
 
     private static $initiated = false;
 
-    private static function init(?NotificationInterface $notification = null): void
+    private static function init(?int $port = 1081): void
     {
         if (self::$initiated === false) {
-            self::$notification = $notification;
+            self::$notification = new ReentrantLockNotification(true);
+            self::$port = $port;
+
             self::$initiated = true;
             self::$mainLock = new \Swoole\Lock(SWOOLE_MUTEX);
             if (self::$defaultForkJoinWorkerFactory === null) {
                 self::$defaultForkJoinWorkerFactory = new DefaultForkJoinWorkerFactory();
             }
             if (self::$common === null) {
-                self::$common = self::makeCommonPool($notification);
+                self::$common = self::makeCommonPool();
 
                 $par = self::$common->config->get() & self::SMASK; // report 1 even if threads disabled
                 self::$commonParallelism = $par > 0 ? $par : 1;
@@ -1499,7 +1519,7 @@ class ForkJoinPool implements ExecutorServiceInterface
             $status->column('status', \Swoole\Table::TYPE_INT);
             $status->create();
 
-            ForkJoinTask::registerNotification($notification);
+            ForkJoinTask::registerNotification(self::$notification);
             ForkJoinTask::registerStatus($status);
             
             $result = new \Swoole\Table(128);
@@ -1514,7 +1534,7 @@ class ForkJoinPool implements ExecutorServiceInterface
         }
     }
 
-    private static function makeCommonPool(?NotificationInterface $notification = null): ForkJoinPool
+    private static function makeCommonPool(): ForkJoinPool
     {
         $parallelism = -1;
         $factory = null;
@@ -1528,7 +1548,7 @@ class ForkJoinPool implements ExecutorServiceInterface
         $parallelism = ($pp !== false) ? intval($pp) : $parallelism;
         $factory = ($fp !== false) ? new $fp() : null;
         $handler = ($hp !== false) ? new $hp() : null;
-        $notificationPort = ($np !== false) ? $np : self::DEFAULT_NOTIFICATION_PORT;
+        $notificationPort = ($np !== false) ? $np : self::$port;
 
         if ($parallelism < 0 && // default 1 less than #cores
             ($parallelism = swoole_cpu_num() - 1) <= 0) {
@@ -1537,16 +1557,15 @@ class ForkJoinPool implements ExecutorServiceInterface
         if ($parallelism > self::MAX_CAP) {
             $parallelism = self::MAX_CAP;
         }
-        $notification ??= new ReentrantLockNotification(true);
-        $pool = new ForkJoinPool($notification, $parallelism, $factory, $handler, self::LIFO_QUEUE, "ForkJoinPool.commonPool-worker-");
+        $pool = new ForkJoinPool($notificationPort, $parallelism, $factory, $handler, self::LIFO_QUEUE, "ForkJoinPool.commonPool-worker-");
         $pool->listen($notificationPort);
 
         return $pool;
     }
 
-    public static function commonPool(?NotificationInterface $notification = null): ForkJoinPool
+    public static function commonPool(?int $port = 1081): ForkJoinPool
     {
-        self::init($notification);
+        self::init($port);
         return self::$common;
     }
 
@@ -2122,6 +2141,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                     return false;
                 }
                 //Thread.yield(); // cannot block
+                usleep(1);
             }
             $found = false;
             for ($j = ($m + 1) << 2; $j >= 0; --$j) {

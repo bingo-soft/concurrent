@@ -1334,7 +1334,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @param thread the thread
      * @return true if is reacquiring
      */
-    public function isOnSyncQueue(int $node, array $nData): bool
+    public function isOnSyncQueue(int $node): bool
     {
         //When Node() is predicessor, then $nData['prev'] === 0, but it is not null
         $nData = $this->queue->get((string) $node);
@@ -1430,9 +1430,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
          * incomplete transfer is both rare and transient, so just
          * spin.
          */
-        /*while (!$this->isOnSyncQueue($node)) {
+        while (!$this->isOnSyncQueue($node['pid'])) {
             //Thread.yield();
-        }*/
+            usleep(1);
+        }
         return false;
     }
 
