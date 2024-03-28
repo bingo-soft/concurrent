@@ -148,6 +148,157 @@ $pool->shutdown(); //shutdown pool with all processes attached
 
 Warning - ForkJoinPool requires stabilization, need to apply new features from OpenJDK.
 
+
+# Example 4 (CompletableFuture based on multiprocessing)
+
+```php
+
+    //4.1 
+    $inputValue = 4;
+
+    //issue non-blocking calls executed on process pool
+    $future = CompletableFuture::supplyAsync(function () use ($inputValue) {
+        $res = $inputValue * $inputValue;
+        return $res;
+    }, $executor)->thenApplyAsync(function ($result) {
+        usleep(100000);
+        $res = $result * 2;
+        return $res;
+    }, $executor)->thenApplyAsync(function ($result) {
+        $res = $result * 2;
+        return $res;
+    }, $executor);
+
+    //blocking call to get resulting value
+    assert($future->get() == 64);
+
+
+    //4.2
+
+    $inputValue = 4;
+
+    $future = CompletableFuture::supplyAsync(function () use ($inputValue) {
+        $res = $inputValue * $inputValue;
+        return $res;
+    })->thenApplyAsync(function ($result) {
+        usleep(100000);
+        $res = $result * 2;
+        return $res;
+    });
+    
+    //non-blocking call that runs after first two non-blocking calls - can be used for logging etc.
+    $future->thenRunAsync(function () {
+        fwrite(STDERR, "Running a follow-up background task...\n");
+    });
+
+    assert($future->get() == 32);
+
+    //4.3
+
+    $future1 = CompletableFuture::supplyAsync(function () {
+        return 2;
+    });
+    $future2 = CompletableFuture::supplyAsync(function () {
+        return 3;
+    });
+
+    //combine results of two futures and make non-blocking computation
+    $resultFuture = $future1->thenCombineAsync($future2, function ($result1, $result2) {
+        return $result1 + $result2;
+    });
+
+    assert($resultFuture->join() == 5);
+
+    //4.4
+
+    $future1 = CompletableFuture::runAsync(function () {
+        // Simulate a task
+        usleep(100000);
+    });
+    $future2 = CompletableFuture::runAsync(function () {
+        // Simulate a task
+        usleep(200000);
+    });
+
+    //non-blocking task running after both futures complete
+    $combinedFuture = $future1->runAfterBothAsync($future2, function () {
+        fwrite(STDERR, "Running a follow-up background task...\n");
+    });
+
+    $combinedFuture->join();
+
+    //4.5
+
+    $future1 = CompletableFuture::supplyAsync(function () {
+        usleep(100000);
+        return 2;
+    });
+    $future2 = CompletableFuture::supplyAsync(function () {
+        return 1;
+    });
+ 
+    //non-blocking task running after either of two futures
+    $resultFuture = $future1->applyToEitherAsync($future2, function ($result) {
+        return $result * 2;
+    });
+
+    //4.6
+
+    $future1 = CompletableFuture::runAsync(function () {
+        // Simulate a task that takes longer
+        usleep(200000);
+    });
+    $future2 = CompletableFuture::runAsync(function () {
+        // Simulate a quicker start
+        usleep(100000);
+    });
+
+    //non-blocking background task running after either of two futures
+    $combinedFuture = $future1->runAfterEitherAsync($future2, function () {
+        fwrite(STDERR, "Running a follow-up background task...\n");
+    });
+
+    //4.7
+
+    //combine results of two non-blocking tasks
+    $future = CompletableFuture::supplyAsync(function () {
+        return "Hello";
+    })->thenApplyAsync(function ($result) {
+        return $result . " World";
+    })->whenCompleteAsync(function ($result, $exception) {
+        if ($exception == null) {
+            assert(strpos($result, "World") !== false);
+        }
+    });
+
+    //4.8
+
+    $future1 = CompletableFuture::supplyAsync(function () {
+        return "Hello";
+    });
+    $future2 = CompletableFuture::supplyAsync(function () {
+        return "World";
+    });
+
+    //future that waits for all provided futures to complete
+    $combinedFuture = CompletableFuture::allOf($future1, $future2);
+    $combinedFuture->get();
+
+    //4.9
+
+     $future1 = CompletableFuture::supplyAsync(function () {
+        //usleep(200000);
+        return "Hello";
+    });
+    $future2 = CompletableFuture::supplyAsync(function () {
+        return "World";
+    });
+
+    //future that waits any of the provided futures to complete
+    $anyOfFuture = CompletableFuture::anyOf($future1, $future2);
+
+```
+
 # Running tests
 
 ```
