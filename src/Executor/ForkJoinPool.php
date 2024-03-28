@@ -11,7 +11,6 @@ use Concurrent\{
 };
 use Concurrent\Lock\{
     LockSupport,
-    NotificationInterface,
     ReentrantLockNotification
 };
 use Concurrent\Queue\{
@@ -33,7 +32,7 @@ use Concurrent\Worker\{
 
 class ForkJoinPool implements ExecutorServiceInterface
 {
-    use NotificationTrait;
+    //use NotificationTrait;
     
     /**
      * Default idle timeout value (in milliseconds) for idle threads
@@ -369,7 +368,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                 if (($stop = ($rs = $this->lockRunState()) & self::STOP) === 0) {
                     if ($this->ctl->get() == $c) {
                         $this->ctl->set($nc);
-                        //fwrite(STDERR, getmypid() . ": (1) set ctl to $nc\n");
                         $add = true;
                     }
                 }
@@ -431,7 +429,7 @@ class ForkJoinPool implements ExecutorServiceInterface
         } finally {
             $this->unlockRunState($rs, $rs & ~self::RSLOCK);
         }
-        $wt->setName($workerNamePrefix . $this->uRShift($i, 1));
+        $wt->setName($this->workerNamePrefix . $this->uRShift($i, 1));
         return $w;
     }
 
@@ -466,7 +464,6 @@ class ForkJoinPool implements ExecutorServiceInterface
             // Attempt the CAS operation
             if ($this->ctl->get() == $c) {
                 $this->ctl->set($nextC);
-                //fwrite(STDERR, getmypid() . ": (2) set ctl to $nextC\n");
                 $success = true;
             }
         }
@@ -495,16 +492,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                 break;
             }
         }
-
-        $errorStack = [];
-        $rex = new \Exception();
-        for ($i = 0; $i < 10; $i += 1) {
-            try {
-                $t = $rex->getTrace()[$i];
-                $errorStack[] = sprintf("%s.%s.%s", $t['file'], $t['function'], $t['line']);
-            } catch (\Throwable $tt) {
-            }
-        }
         if ($ex === null) {                             // help clean on way out
             //ForkJoinTask::helpExpungeStaleExceptions();
             //@TODO ^^^^
@@ -528,7 +515,6 @@ class ForkJoinPool implements ExecutorServiceInterface
         $i = 0;
         $v = null;
         $p = null;
-        //fwrite(STDERR, getmypid() . ": signalWorlk\n" );
         while (($c = $this->ctl->get()) < 0) {                       // too few active
             if (($sp = ThreadLocalRandom::longToInt($c)) === 0) {                  // no idle workers
                 $debugStamp = hrtime(true);
@@ -542,11 +528,9 @@ class ForkJoinPool implements ExecutorServiceInterface
                 break;
             }
             if (count($ws) <= ($i = $sp & self::SMASK)) {       // terminated
-                //fwrite(STDERR, getmypid() . ": Queue is terminated!\n" );
                 break;
             }
             if (($v = (isset($ws[$i]) ? $ws[$i] : null)) == null) {               // terminating
-                //fwrite(STDERR, getmypid() . ": Queue is terminating!\n" );
                 break;
             }
             $vs = ($sp + self::SS_SEQ) & ~self::INACTIVE;        // next scanState
@@ -554,16 +538,13 @@ class ForkJoinPool implements ExecutorServiceInterface
             $nc = (self::UC_MASK & ($c + self::AC_UNIT)) | (self::SP_MASK & $v->stackPred);
             if ($d == 0 && $this->ctl->get() === $c) {
                 $this->ctl->set($nc);
-                //fwrite(STDERR, getmypid() . ": (3) set ctl to $nc\n");
                 $v->scanState->set($vs);                      // activate v
                 if (($p = $v->parker->get()) !== 0) {
                     LockSupport::unpark($p);
-                    //fwrite(STDERR, getmypid() . ": Process is unparked $p\n" );
                 }
                 break;
             }
             if ($q !== null && $q->isEmpty()) {         // no more work
-                //fwrite(STDERR, getmypid() . ": Queue is empty!\n" );
                 break;
             }
         }
@@ -588,11 +569,9 @@ class ForkJoinPool implements ExecutorServiceInterface
             $nc = (self::UC_MASK & ($c + $inc)) | (self::SP_MASK & $v->stackPred);
             if ($this->ctl->get() == $c) {
                 $this->ctl->set($nc);
-                //fwrite(STDERR, getmypid() . ": (4) set ctl to $nc\n");
                 $v->scanState->set($vs);
                 if (($p = $v->parker->get()) !== 0) {
                     LockSupport::unpark($p);
-                    //fwrite(STDERR, getmypid() . ": (2) Process is unparked $p\n" );
                 }
                 return true;
             }
@@ -666,7 +645,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                                     if ($n < -1) {      // signal others
                                         $this->signalWork($ws, $q);
                                     }
-                                    //fwrite(STDERR, getmypid() . ": steal task from queue " . serialize($t) . "\n");
                                     return $t;
                                 }
                             } elseif ($oldSum == 0 &&   // try to activate
@@ -701,8 +679,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                         $w->stackPred = ThreadLocalRandom::longToInt($c);         // hold prev stack top
                         $w->scanState->set($ns);
                         if ($this->ctl->get() == $c) {
-                            $this->ctl->set($nc);
-                            //fwrite(STDERR, getmypid() . ": (5) set ctl to $nc\n");                         
+                            $this->ctl->set($nc);             
                             $ss = $ns;
                         } else {
                             $w->scanState->set($ss);
@@ -771,7 +748,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                     $t = ThreadLocalRandom::unsignedRightShiftWithCast($c, self::TC_SHIFT, 16);  // shrink excess spares
                     if ($t > 2 && $this->ctl->get() === $c) {
                         $this->ctl->set($prevctl);
-                        //fwrite(STDERR, getmypid() . ": (6) set ctl to $prevctl\n");
                         return false;                 // else use timed wait
                     }
                     $parkTime = self::IDLE_TIMEOUT * (($t >= 0) ? 1 : 1 - $t);
@@ -783,10 +759,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                 }
                 $w->parker->set($w->owner->getPid());
                 if ($w->scanState->get() < 0 && $this->ctl->get() == $c) {      // recheck before park
-                    //fwrite(STDERR, getmypid() . ": Process will be parked => " . $w->owner->thread->pid . " in a second\n");
-                    //fwrite(STDERR, getmypid() . ": Parked queue properties: empty = " . $w->isEmpty(). ", size = " . $w->queueSize() . "\n");
                     LockSupport::parkNanos($w->owner->thread, $parkTime);
-                    //fwrite(STDERR, getmypid() . ": Process is unparked => " . $w->owner->thread->pid . "\n");
                 }
                 $w->parker->set(0);
                 if ($w->scanState->get() >= 0) {
@@ -796,7 +769,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                     $deadline - hrtime(true) <= 0 &&
                     $this->ctl->get() == $c) {
                     $this->ctl->set($prevctl);
-                    //fwrite(STDERR, getmypid() . ": (7) set ctl to $prevctl\n");
                     return false;                     // shrink pool
                 }
             }
@@ -936,7 +908,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                            (~self::AC_MASK & $c));       // uncompensated
                 if ($this->ctl->get() === $c) {
                     $this->ctl->set($nc);
-                    //fwrite(STDERR, getmypid() . ": (8) set ctl to $nc\n");                    
                     $canBlock = true;
                 }
             } elseif ($tc >= self::MAX_CAP ||
@@ -951,7 +922,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                     if ($this->ctl->get() == $c) {
                         $add = true;
                         $this->ctl->set($nc);
-                        //fwrite(STDERR, getmypid() . ": (9) set ctl to $nc\n");
                     }
                 }
                 $this->unlockRunState($rs, $rs & ~self::RSLOCK);
@@ -1074,12 +1044,10 @@ class ForkJoinPool implements ExecutorServiceInterface
                 if ($this->ctl->get() == $c) {
                     $active = false;
                     $this->ctl->set($nc);
-                    //fwrite(STDERR, getmypid() . ": (10) set ctl to $nc\n");
                 }
             } elseif (ThreadLocalRandom::unsignedRightShiftWithCast($c = $this->ctl->get(), self::AC_SHIFT, 32) + ($this->config->get() & self::SMASK) <= 0 && $this->ctl->get() == $c) {
                 $nc = $c + self::AC_UNIT;
                 $this->ctl->set($nc);
-                //fwrite(STDERR, getmypid() . ": (11) set ctl to $nc\n");
                 break;
             }                
         }
@@ -1270,7 +1238,6 @@ class ForkJoinPool implements ExecutorServiceInterface
                             if ($w->scanState->get() < 0) {
                                 // wake up
                                 LockSupport::unpark($wt->getPid());
-                                //fwrite(STDERR, getmypid() . ": (3) Process is unparked $p\n" );
                             }
                         }
                     }
@@ -1349,8 +1316,8 @@ class ForkJoinPool implements ExecutorServiceInterface
                     //$a = $q->array;
                     //$s = $q->top->get();
                     $submitted = false; // initial submission or resizing
-                    try {                      // locked version of push
-                          $q->push($task);
+                    try {// locked version of push
+                        $q->push($task);
                         $submitted = true;
                     } finally {
                         $q->qlock->cmpset(1, 0);
@@ -1481,7 +1448,6 @@ class ForkJoinPool implements ExecutorServiceInterface
         $this->config = new \Swoole\Atomic\Long(($parallelism & self::SMASK) | $mode);
         $np = -$parallelism; // offset ctl counts
         $ctl = (($np << self::AC_SHIFT) & self::AC_MASK) | (($np << self::TC_SHIFT) & self::TC_MASK);
-        //fwrite(STDERR, getmypid() . ": ctl initialized to $ctl\n");
         $this->ctl = new \Swoole\Atomic\Long($ctl);
     }
 
@@ -1490,11 +1456,13 @@ class ForkJoinPool implements ExecutorServiceInterface
     private static function init(?int $port = 1081): void
     {
         if (self::$initiated === false) {
+            self::$initiated = true;        
+            
+            self::$mainLock = new \Swoole\Lock(SWOOLE_MUTEX);
+
             self::$notification = new ReentrantLockNotification(true);
             self::$port = $port;
 
-            self::$initiated = true;
-            self::$mainLock = new \Swoole\Lock(SWOOLE_MUTEX);
             if (self::$defaultForkJoinWorkerFactory === null) {
                 self::$defaultForkJoinWorkerFactory = new DefaultForkJoinWorkerFactory();
             }
@@ -1513,24 +1481,8 @@ class ForkJoinPool implements ExecutorServiceInterface
             $meta->create();
 
             self::$threadMeta = $meta;
-
-            //@TODO - combine status and result
-            $status = new \Swoole\Table(128);
-            $status->column('status', \Swoole\Table::TYPE_INT);
-            $status->create();
-
-            ForkJoinTask::registerNotification(self::$notification);
-            ForkJoinTask::registerStatus($status);
             
-            $result = new \Swoole\Table(128);
-            $result->column('result', \Swoole\Table::TYPE_STRING, 64);
-            $result->create();
-            ForkJoinTask::registerResult($result);
-            
-            $fork = new \Swoole\Table(128);
-            $fork->column('pid', \Swoole\Table::TYPE_INT);
-            $fork->create();
-            ForkJoinTask::registerFork($fork);
+            ForkJoinTask::init(self::$notification);                      
         }
     }
 
@@ -1558,7 +1510,7 @@ class ForkJoinPool implements ExecutorServiceInterface
             $parallelism = self::MAX_CAP;
         }
         $pool = new ForkJoinPool($notificationPort, $parallelism, $factory, $handler, self::LIFO_QUEUE, "ForkJoinPool.commonPool-worker-");
-        $pool->listen($notificationPort);
+        LockSupport::init($notificationPort);
 
         return $pool;
     }
@@ -2189,5 +2141,12 @@ class ForkJoinPool implements ExecutorServiceInterface
     public function getScopeArguments()
     {
         return $this->scopeArguments;
+    }
+
+    public static function managedBlock(ManagedBlockerInterface $blocker): void
+    {
+        //@TODO. no specific for fork join pool
+        do {
+        } while (!$blocker->isReleasable() && !$blocker->block());
     }
 }

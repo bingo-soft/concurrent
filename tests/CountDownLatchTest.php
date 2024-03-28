@@ -3,13 +3,18 @@
 namespace Tests;
 
 use PHPUnit\Framework\TestCase;
-use Concurrent\Lock\CountDownLatch;
+use Concurrent\Lock\{
+    CountDownLatch,
+    LockSupport
+};
 use Concurrent\Worker\InterruptibleProcess;
 
 class CountDownLatchTest extends TestCase
 {
-    protected function setUp(): void
+    public static function setUpBeforeClass(): void
     {
+        //Initialize IPC at port 1081
+        LockSupport::init(1082);
     }
 
     public function testMethods(): void

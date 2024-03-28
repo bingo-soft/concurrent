@@ -34,7 +34,6 @@ class ForkJoinWorker implements ThreadInterface
         $scope = $this;
         $args = $pool->getScopeArguments();
         $this->thread = new InterruptibleProcess(function ($process) use ($scope, $args) {
-            //fwrite(STDERR, getmypid() . ": new worker process started with this pid: " . $process->pid . "\n");
             $scope->pid->set($process->pid);
             ForkJoinTask::$fork->set((string) $process->pid, ['pid' => $process->pid]);
             $scope->run($process, ...$args);
@@ -128,17 +127,6 @@ class ForkJoinWorker implements ThreadInterface
                 $this->pool->runWorker($this->workQueue, $process, ...$args);
             } catch (\Throwable $ex) {
                 $exception = $ex;
-
-                /*$errorStack = [];
-                for ($i = 0; $i < 5; $i += 1) {
-                    try {
-                        $t = $ex->getTrace()[$i];
-                        $errorStack[] = sprintf("%s.%s.%s", $t['file'], $t['function'], $t['line']);
-                    } catch (\Throwable $tt) {
-                    }
-                }*/
-
-                //fwrite(STDERR, getmypid() . ": worker ERROR (1): " . $ex->getMessage() . " " . implode(" <= ", $errorStack) . "\n");
             } finally {
                 try {
                     $this->onTermination($exception);
@@ -146,7 +134,6 @@ class ForkJoinWorker implements ThreadInterface
                     if ($exception == null) {
                         $exception = $ex;
                     }
-                    fwrite(STDERR, getmypid() . ": worker ERROR (2): " . $ex->getMessage() . "\n");
                 } finally {
                     $this->pool->deregisterWorker($this, $exception);
                 }

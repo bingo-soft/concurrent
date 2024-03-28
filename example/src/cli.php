@@ -22,6 +22,6 @@ try {
     while (true) {
         sleep(1);
     }
-} catch (Exception $e) {
+} catch (\Exception $e) {
     fwrite(STDERR, $e->getMessage());
 }

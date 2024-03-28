@@ -13,10 +13,11 @@ use Concurrent\Task\ForkJoinTask;
 use Concurrent\Worker\InterruptibleProcess;
 use Concurrent\Executor\ThreadLocalRandom;
 
-class ForkJoinPoolTest extends TestCase
+abstract class ForkJoinPoolTest extends TestCase
 {
-    protected function setUp(): void
+    public static function setUpBeforeClass(): void
     {
+        LockSupport::init(1083);
     }
 
     public function testMethods(): void
@@ -26,6 +27,6 @@ class ForkJoinPoolTest extends TestCase
         $result = $pool->invoke(new SumTask(1, 300000));
         //$end = hrtime(true);
         //fwrite(STDERR, getmypid() . ": Result (concurrent) = $result, elapsed: " . ($end - $start) . "\n");
-        $this->assertEquals(45000150000, $result);      
+        $this->assertEquals(45000150000, $result);
     }
 }

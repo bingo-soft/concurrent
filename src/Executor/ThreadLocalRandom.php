@@ -164,6 +164,7 @@ class ThreadLocalRandom
             $add = self::signedAdd($seed, $inc);
             $seeder->set(gmp_strval($add));
 
+            $data = [];
             $data['pid'] = getmypid();
             $data['probe'] = $probe;
             $data['seed'] = gmp_strval(self::mix64($prev));
@@ -177,6 +178,9 @@ class ThreadLocalRandom
         $probe ^= gmp_intval(self::unsignedRightShift($probe, 17));
         $probe ^= $probe << 5;
         $data = $threadMeta->get((string) getmypid());
+        if ($data === false) {
+            $data = [];
+        }
         $data['probe'] = $probe;
         $threadMeta->set((string) getmypid(), $data);
         return $probe;
@@ -201,9 +205,12 @@ class ThreadLocalRandom
             $r = gmp_strval($r);
         } else {
             self::localInit($threadMeta);
-            if (($r = $thread->getSeed()->get()) == 0) {
+            if (($r = $threadMeta->get((string) getmypid(), 'seed')) === 0) {
                 $r = 1; // avoid zero
             }
+        }
+        if ($data === false) {
+            $data = [];
         }
         $data['secondary'] = $r;
         $threadMeta->set((string) getmypid(), $data);

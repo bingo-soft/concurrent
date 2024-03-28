@@ -20,5 +20,5 @@ interface ExecutorInterface
      *
      * @param socket either url or socket port
      */
-    public function listen(int $port): void;
+    //public function listen(int $port): void;
 }

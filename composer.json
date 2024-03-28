@@ -17,6 +17,7 @@
     },
     "require": {
         "php": "^7.4 || ^8.0",
+        "charescape/serialize-closure": "^3.8",
         "bingo-soft/util": "^1.8"
     },
     "require-dev": {

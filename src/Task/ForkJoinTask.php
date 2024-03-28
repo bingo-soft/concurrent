@@ -841,11 +841,19 @@ abstract class ForkJoinTask implements FutureInterface
             if ($this->toShort($s = self::$status->get($this->xid, 'status')) !== $e) {
                 return false;
             }
-            if (self::$status->get($this->xid, 'status') == $s) {
-                self::$status->set($this->xid, ['status' => ($s & ~self::SMASK) | ($tag & self::SMASK)]);
+            if ($this->casStatus($s, ($s & ~self::SMASK) | ($tag & self::SMASK))) {
                 return true;
             }
         }
+    }
+
+    private function casStatus(int $c, int $v): bool
+    {
+        if (self::$status->get($this->getXid(), 'status') === $c) {
+            self::$status->set($this->getXid(), ['status' => $v]);
+            return true;
+        }
+        return false;
     }
 
      /**
@@ -874,6 +882,31 @@ abstract class ForkJoinTask implements FutureInterface
                 $t->cancel(false);
             } catch (\Throwable $ignore) {
             }
+        }
+    }
+
+    private static $initiated = false;
+    
+    public static function init(NotificationInterface $notification): void
+    {
+        if (!self::$initiated) {
+            self::registerNotification($notification);
+
+            //@TODO - combine status and result, take into account, that other pools can be used with ForkJoinTask
+            $status = new \Swoole\Table(128);
+            $status->column('status', \Swoole\Table::TYPE_INT);
+            $status->create();
+            self::registerStatus($status);
+
+            $result = new \Swoole\Table(128);
+            $result->column('result', \Swoole\Table::TYPE_STRING, 64);
+            $result->create();
+            self::registerResult($result);
+
+            $fork = new \Swoole\Table(128);
+            $fork->column('pid', \Swoole\Table::TYPE_INT);
+            $fork->create();
+            self::registerFork($fork);
         }
     }
 }

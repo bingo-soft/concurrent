@@ -158,12 +158,7 @@ class ForkJoinWorkQueue
         $task = $this->array->get((string) $newTop, 'task');
         $this->array->del((string) $newTop);
 
-        $t = unserialize($task);
-        
-        if ($t->start == 1 || $t->start == 9376) {
-            //fwrite(STDERR, getmypid() . ": Task poped from the queue: $task\n");
-        }
-        return $t;
+        return unserialize($task);
     }
 
     /**

@@ -16,8 +16,6 @@ use Concurrent\Worker\WorkerFactory;
 
 class DefaultPoolExecutor implements ExecutorServiceInterface
 {
-    use NotificationTrait;    
-    
     private $ctl;
     private const COUNT_BITS = ( PHP_INT_SIZE * 4 ) - 3;
     private const CAPACITY   = (1 << self::COUNT_BITS) - 1;

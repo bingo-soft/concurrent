@@ -146,7 +146,7 @@ $pool->shutdown(); //shutdown pool with all processes attached
     assert(45000150000, $result); 
 ```
 
-Warning - ForkJoinPool requires stabilization, need to apply new features from JDK22.
+Warning - ForkJoinPool requires stabilization, need to apply new features from OpenJDK.
 
 # Running tests
 

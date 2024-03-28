@@ -5,6 +5,7 @@ namespace Concurrent\Lock;
 use Concurrent\ThreadInterface;
 use Concurrent\Worker\InterruptibleProcess;
 use Util\Net\{
+    InetSocketAddress,
     ServerSocket,
     Socket
 };
@@ -20,6 +21,7 @@ class LockSupport
     {
     }
 
+    //You may run it in a background persistent process to keep socket alive
     public static function init(int $port): void
     {
         if (self::$initialized === false) {
@@ -35,35 +37,52 @@ class LockSupport
                 self::$blocks->create();
             }
 
-            $server = new InterruptibleProcess(function ($process) use ($port) {
-                $server = new ServerSocket($port);
-                $waiters = [];
-                $pids = [];
-                while ($member = $server->accept()) {
-                    $isNotifier = false;
-                    while ($pid = $member->read(8192)) {
-                        //Receive PID of a process to be unparked
-                        if (strpos($pid, "h") === false) {
-                            $isNotifier = true;
-                            $pids[] = $pid;
-                        } else {
-                            //Skip handshake message (h<PID>) from waiting process
-                            break;
+            $socketAddress = new InetSocketAddress("localhost", $port);
+            $socket = new Socket();
+            $isAlive = false;
+            try {
+                $socket->connect($socketAddress);
+                $socket->close();
+                $isAlive = true;
+            } catch (\Throwable $t) {
+                //ignore
+            }
+            if ($isAlive === false) {
+                $server = new InterruptibleProcess(function ($process) use ($port) {
+                    $server = new ServerSocket($port);
+                    $waiters = [];
+                    $pids = [];
+                    try {
+                        while ($member = $server->accept()) {
+                            $isNotifier = false;
+                            while ($pid = $member->read(8192)) {
+                                //Receive PID of a process to be unparked
+                                if (strpos($pid, "h") === false) {
+                                    $isNotifier = true;
+                                    $pids[] = $pid;
+                                } else {
+                                    //Skip handshake message (h<PID>) from waiting process
+                                    break;
+                                }
+                            }
+                            //Collect all waiters
+                            if (!$isNotifier) {
+                                $waiters[] = $member;
+                            }
+                            //Notify all waiters 
+                            foreach ($waiters as $waiter) {
+                                foreach ($pids as $pid) {
+                                    $waiter->write($pid);
+                                }
+                            }
                         }
+                    } catch (\Throwable $t) {
+                        //ignore
+                        fwrite(STDERR, getmypid() . ": server socket for IPC is already running or not reachable at port $port\n");
                     }
-                    //Collect all waiters
-                    if (!$isNotifier) {
-                        $waiters[] = $member;
-                    }
-                    //Notify all waiters 
-                    foreach ($waiters as $waiter) {
-                        foreach ($pids as $pid) {
-                            $waiter->write($pid);
-                        }
-                    }
-                }
-            });
-            $server->start();
+                });
+                $server->start();
+            }
 
             self::$initialized = true;
         }
@@ -97,7 +116,7 @@ class LockSupport
 
     public static function parkNanos(?ThreadInterface $thread = null, ?int $nanosTimeout = 0): void
     {
-        time_nanosleep(0, $nanos);
+        time_nanosleep(0, $nanosTimeout);
         self::doPark($thread);
     }
 
@@ -109,7 +128,7 @@ class LockSupport
             return;
         }*/
         $pid = $thread !== null ? $thread->pid : getmypid();
-        $permit = self::$permits->get((string) $pid);
+        $permit = self::$permits->get((string) $pid);        
         if ($permit !== false && $permit['permit'] === 1) {
             self::$permits->set((string) $pid, ['permit' => 0]);
         } else {

@@ -137,7 +137,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *
      * @param mode 1 for exclusive, 2 for shared
      */
-    private function addWaiter(?ThreadInterface $thread = null, int $mode)
+    private function addWaiter(?ThreadInterface $thread = null, int $mode = 0)
     {
         $pid = $thread !== null ? $thread->getPid() : getmypid();
         if ($mode == 1) {
