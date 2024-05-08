@@ -372,7 +372,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
 
                             $this->queue->del((string) $pred);
                             if ($shared) {
-                                $this->signalNextIfShared($thread, $node['id']);
+                                $this->signalNextIfShared($node['id']);
                             }
                             if ($interrupted && $thread !== null) {
                                 $thread->interrupt();
