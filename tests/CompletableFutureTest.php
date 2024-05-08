@@ -249,7 +249,7 @@ class CompletableFutureTest extends TestCase
     public function testAnyOf(): void
     {
         $future1 = CompletableFuture::supplyAsync(function () {
-            //usleep(200000);
+            usleep(200000);
             fwrite(STDERR, getmypid() . ": (2) first of any returns last\n");
             return "Hello";
         });
@@ -262,6 +262,8 @@ class CompletableFutureTest extends TestCase
 
         $result = $anyOfFuture->get();
 
-        $this->assertTrue($result == "Hello" || $result == "World");
+        usleep(300000);
+
+        $this->assertTrue($result == "World");
     }
 }

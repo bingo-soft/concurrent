@@ -52,7 +52,7 @@ class Signaller extends Completion implements ManagedBlockerInterface
         if (CompletableFuture::$signallers->get($this->xid) !== false) {
             $pid = CompletableFuture::$signallers->get($this->xid, 'pid');
             CompletableFuture::$signallers->del($this->xid);
-            LockSupport::unpark($pid);                       
+            LockSupport::unpark($pid, hrtime(true));                       
         }
         return null;
     }

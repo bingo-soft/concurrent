@@ -3,12 +3,11 @@
 namespace Concurrent\Task;
 
 use Concurrent\{
-    FutureInterface,
-    RunnableInterface,
+    RunnableFutureInterface,
     ThreadInterface
 };
 
-class AdaptedCallable extends ForkJoinTask implements RunnableInterface, FutureInterface
+class AdaptedCallable extends ForkJoinTask implements RunnableFutureInterface
 {
     public $callable;
 

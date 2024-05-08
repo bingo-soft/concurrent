@@ -205,7 +205,7 @@ class ForkJoinWorkQueue
     /**
      * Returns next task, if one exists, in order specified by mode.
      */
-    public function peek(): ?ForkJoinTask
+    public function peek()
     {
         if ($this->isEmpty()) {
             return null;

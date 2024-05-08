@@ -236,4 +236,20 @@ class ThreadLocalRandom
         
         return $number; // Ensure it's returned as an int for consistency
     }
+
+    public static function intToByte(int $number): int {
+        // Simulate Java's int to byte casting by taking the 8 least significant bits
+        // This is done by first getting the remainder (modulo) when divided by 2^8 (256),
+        // to mimic the overflow behavior. Then, we adjust if the result is beyond the 
+        // 8-bit byte range, similar to how Java treats casting of int to byte.
+        $number = $number % 256; // Modulo 2^8 to simulate overflow/underflow
+        
+        // Adjust if the number exceeds the 8-bit byte range
+        if ($number >= 128) {
+            // If in the upper half of the 8-bit range, subtract 2^8 to get the negative counterpart
+            $number -= 256;
+        } // Note: No need for a lower bound check, unlike in intToLong, due to $number being within -255 to 255 after modulo
+        
+        return $number; // Ensure it's returned as an int for consistency
+    }
 }

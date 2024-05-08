@@ -37,7 +37,7 @@ class CountDownLatchTest extends TestCase
         $initializer->initializeComponent(function () {
             fwrite(STDERR, getmypid() . ": Process is sleeping for 4 seconds\n");
             sleep(4);
-        });      
+        }); 
 
         $start = hrtime(true);
         $initializer->awaitInitialization();

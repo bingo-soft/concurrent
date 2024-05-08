@@ -4,7 +4,7 @@ namespace Concurrent\Executor;
 
 use Concurrent\{
     ExecutorServiceInterface,
-    RunnableFuture,
+    RunnableFutureInterface,
     RunnableInterface,
     ThreadInterface,
     TimeUnit
@@ -540,7 +540,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                 $this->ctl->set($nc);
                 $v->scanState->set($vs);                      // activate v
                 if (($p = $v->parker->get()) !== 0) {
-                    LockSupport::unpark($p);
+                    LockSupport::unpark($p, hrtime(true));
                 }
                 break;
             }
@@ -571,7 +571,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                 $this->ctl->set($nc);
                 $v->scanState->set($vs);
                 if (($p = $v->parker->get()) !== 0) {
-                    LockSupport::unpark($p);
+                    LockSupport::unpark($p, hrtime(true));
                 }
                 return true;
             }
@@ -1237,7 +1237,7 @@ class ForkJoinPool implements ExecutorServiceInterface
                             }
                             if ($w->scanState->get() < 0) {
                                 // wake up
-                                LockSupport::unpark($wt->getPid());
+                                LockSupport::unpark($wt->getPid(), hrtime(true));
                             }
                         }
                     }
@@ -2123,7 +2123,7 @@ class ForkJoinPool implements ExecutorServiceInterface
         self::$common->awaitQuiescence(PHP_INT_MAX, TimeUnit::NANOSECONDS);
     }
 
-    protected function newTaskFor(RunnableInterface | callable $action, &$value = null): RunnableFuture
+    protected function newTaskFor(RunnableInterface | callable $action, &$value = null): RunnableFutureInterface
     {
         if ($action instanceof RunnableInterface) {
             return new AdaptedRunnable($action, $value);

@@ -6,17 +6,15 @@ use Concurrent\ThreadInterface;
 
 abstract class AbstractOwnableSynchronizer implements SynchronizerInterface
 {
-    /**
-     * Empty constructor for use by subclasses.
-     */
     public function __construct()
     {
+        $this->exclusiveOwnerThread = new \Swoole\Atomic\Long(-1);
     }
 
     /**
      * The current owner of exclusive mode synchronization.
      */
-    private $exclusiveOwnerThread;
+    protected $exclusiveOwnerThread;
 
     /**
      * Sets the thread that currently owns exclusive access.
@@ -25,9 +23,9 @@ abstract class AbstractOwnableSynchronizer implements SynchronizerInterface
      * {@code volatile} field accesses.
      * @param thread the owner thread
      */
-    protected function setExclusiveOwnerThread(?ThreadInterface $thread = null): void
+    protected function setExclusiveOwnerThread(int $pid): void
     {
-        $this->exclusiveOwnerThread = $thread;
+        $this->exclusiveOwnerThread->set($pid);
     }
 
     /**
@@ -36,8 +34,8 @@ abstract class AbstractOwnableSynchronizer implements SynchronizerInterface
      * impose any synchronization or {@code volatile} field accesses.
      * @return the owner thread
      */
-    protected function getExclusiveOwnerThread(): ?ThreadInterface
+    protected function getExclusiveOwnerThread(): int
     {
-        return $this->exclusiveOwnerThread;
+        return $this->exclusiveOwnerThread->get();
     }
 }

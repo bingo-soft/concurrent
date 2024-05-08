@@ -2,20 +2,30 @@
 
 namespace Concurrent\Lock;
 
-use Concurrent\ThreadInterface;
-use Concurrent\TimeUnit;
+use Concurrent\{
+    ThreadInterface,
+    TimeUnit
+};
+use Concurrent\Executor\ForkJoinPool;
+use Concurrent\Lock\LockSupport;
 
 class ConditionObject implements ConditionInterface
 {
     /** First node of condition queue. */
-    private $firstWaiter;
+    public $firstWaiter;
     /** Last node of condition queue. */
-    private $lastWaiter;
+    public $lastWaiter;
 
-    private $synchronizer;
+    public $synchronizer;
 
     //Condition queue
-    private $queue;
+    public $queue;
+
+    private const OOME_COND_WAIT_DELAY = 10_000_000; // 10 m
+
+    private const DELETE_THRESHOLD = 50;
+
+    private $nodeLock;
 
     /**
      * Creates a new {@code ConditionObject} instance.
@@ -23,128 +33,141 @@ class ConditionObject implements ConditionInterface
     public function __construct(?SynchronizerInterface $synchronizer)
     {
         $this->synchronizer = $synchronizer;
+        $this->synchronizer->addCondition($this);
         $this->firstWaiter = new \Swoole\Atomic\Long(-1);
         $this->lastWaiter = new \Swoole\Atomic\Long(-1);
 
-        $queue = new \Swoole\Table(128); //128 -> alloc(): mmap(21264) failed, Error: Too many open files in system[23]
-        $queue->column('next', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('prev', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('pid', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('nextWaiter', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('waitStatus', \Swoole\Table::TYPE_INT, 8);
+        $queue = new \Swoole\Table(2048);
+        $queue->column('id', \Swoole\Table::TYPE_INT);
+        $queue->column('next', \Swoole\Table::TYPE_INT);
+        $queue->column('prev', \Swoole\Table::TYPE_INT);
+        $queue->column('waiter', \Swoole\Table::TYPE_INT);
+        $queue->column('nextWaiter', \Swoole\Table::TYPE_INT);
+        $queue->column('status', \Swoole\Table::TYPE_INT);
+        //0 - exclusive, 1 - shared
+        $queue->column('mode', \Swoole\Table::TYPE_INT, 2);
+        $queue->column('release', \Swoole\Table::TYPE_INT);
+        $queue->column('version', \Swoole\Table::TYPE_INT);
         $queue->create();
         $this->queue = $queue;
+
+        $this->nodeLock = new \Swoole\Atomic\Long(-1);
     }
 
-    // Internal methods
-
-    /**
-     * Adds a new waiter to wait queue.
-     * @return its new wait node
-     */
-    private function addConditionWaiter(?ThreadInterface $thread = null): array
+    //shared with AQS
+    public function getAndUnsetStatus(array &$node, int $v, bool $sync = true): int
     {
-        $t = $this->lastWaiter;
-        $lwData = $this->queue->get((string) $t->get());
-
-        // If lastWaiter is cancelled, clean out.
-        if ($t->get() !== -1 && $lwData['waitStatus'] !== Node::CONDITION) {
-            $this->unlinkCancelledWaiters();
-            $t = $this->lastWaiter;
-        }
-        $pid = $thread !== null ? $thread->pid : getmypid();
-        $node = ['prev' => -1, 'next' => -1, 'pid' => $pid, 'nextWaiter' => -1, 'waitStatus' => Node::CONDITION];
-        $this->queue->set((string) $pid, $node);
-        if ($t->get() === -1) {
-            $this->firstWaiter->set($pid);            
-        } else {
-            $nwData = $this->queue->get((string) $t->get());
-            $nwData['nextWaiter'] = $pid;
-            $this->queue->set((string) $t->get(), $nwData);
-        }
-        $this->lastWaiter->set($pid);
-        return $node;
+        $status = $node['status'];
+        $node['status'] = $status & (~$v);
+        $this->upsertNodeAtomically($node['id'], ['status' => $node['status']], $sync);        
+        return $status;
     }
 
-    /**
-     * Removes and transfers nodes until hit non-cancelled one or
-     * null. Split out from signal in part to encourage compilers
-     * to inline the case of no waiters.
-     * @param first (non-null) the first node on condition queue
-     */
-    private function doSignal(int $first): void
+    private function upsertNodeAtomically(int $id, array $values, bool $sync = true, bool $updateIfExists = false): void
     {
-        do {
-            $fData = $this->queue->get((string) $first);
-            if ($fData['nextWaiter'] === -1) {
-                $this->firstWaiter->set(-1);
-                $this->lastWaiter->set(-1);                
+        if ($updateIfExists && !$this->queue->exists((string) $id)) {
+            return;
+        }
+        try {
+            $retry = false;
+            while (true) {
+                $i = 1;
+                while ($this->nodeLock->get() !== -1  && !(($op = $this->synchronizer->operationLock->get()) === -1 || $op === getmypid())) {
+                    usleep(1);
+                    if ($i++ % 10000 === 0) {
+                        fwrite(STDERR, getmypid() . ": updating condition node takes too much wait cycles [$i]!\n");
+                    }
+                }
+                if ($this->nodeLock->cmpset(-1, $id) || $retry) {
+                    $retry = false; 
+                    if ($newNode !== null && !$this->queue->exists((string) $id)) {
+                        foreach ($values as $key => $value) {
+                            $newNode[$key] = $value;
+                        }
+                        $this->queue->set($id, $newNode);
+                        if ($sync) {               
+                            $this->synchronizer->syncExternalNode($id, $values);
+                        }
+                    } else {    
+                        $newNode = $this->queue->get((string) $id);
+                        foreach ($values as $key => $value) {
+                            $newNode[$key] = $value;
+                        }
+                        $newNode['version'] = $newNode['version'] + 1;
+
+                        $this->queue->set($id, $newNode);
+                        if ($sync) {
+                            $this->synchronizer->syncExternalNode($id, $values);
+                        }
+                    }
+         
+                    $newNode = $this->queue->get((string) $id);
+                    foreach ($values as $key => $value) {
+                        if ($newNode[$key] !== $value) {
+                            $retry = true;
+                            continue 2;
+                        }
+                    }
+                    break;
+                }
             }
-            $fData['nextWaiter'] = -1;
-            $this->queue->del((string) $first);
-        } while (!$this->synchronizer->transferForSignal($fData) &&
-                 ($first = $this->firstWaiter->get()) !== -1);
+        } finally {
+            $this->nodeLock->cmpset($id, -1);
+        }
+    }
+    
+    public function clearStatus(array &$node): void
+    {
+        $node['status'] = 0;
+        $this->upsertNodeAtomically($node['id'], ['status' => 0]);
+    }
+
+    public function setStatusRelaxed(array &$node, int $s): void
+    {
+        $node['status'] = $s;
+        $this->upsertNodeAtomically($node['id'], ['status' => $s]);
+    }
+
+    public function syncExternalNode(int $id, array $values): void
+    {
+        $this->upsertNodeAtomically($id, $values, false, true);
+    }
+
+    public function isReleasable(array $node): bool
+    {
+        return $this->queue->get($node['id'], 'status') <= 1; //Thread.currentThread().isInterrupted();
+    }
+
+    public function block(array $node): bool
+    {
+        while (!$this->isReleasable($node)) {
+            LockSupport::park($node['waiter']);
+        }
+        return true;
     }
 
     /**
-     * Removes and transfers all nodes.
-     * @param first (non-null) the first node on condition queue
+     * Removes and transfers one or all waiters to sync queue.
      */
-    private function doSignalAll(int $first): void
+    private function doSignal(int $first, bool $all = false): void
     {
-        $this->lastWaiter->set(-1);
-        $this->firstWaiter->set(-1);
-        do {
+        while ($first !== -1) {
             $fData = $this->queue->get((string) $first);
             $next = $fData['nextWaiter'];
-            $this->synchronizer->transferForSignal($fData);
-            $this->queue->del((string) $first);
-            $first = $next;
-        } while ($first !== -1);
-    }
-
-    /**
-     * Unlinks cancelled waiter nodes from condition queue.
-     * Called only while holding lock. This is called when
-     * cancellation occurred during condition wait, and upon
-     * insertion of a new waiter when lastWaiter is seen to have
-     * been cancelled. This method is needed to avoid garbage
-     * retention in the absence of signals. So even though it may
-     * require a full traversal, it comes into play only when
-     * timeouts or cancellations occur in the absence of
-     * signals. It traverses all nodes rather than stopping at a
-     * particular target to unlink all pointers to garbage nodes
-     * without requiring many re-traversals during cancellation
-     * storms.
-     */
-    private function unlinkCancelledWaiters(): void
-    {
-        $t = $this->firstWaiter->get();
-        $trail = null;
-        while ($t !== -1) {
-            $tData = $this->queue->get((string) $t);
-            $next = $tData['nextWaiter'];
-            if ($tData['waitStatus'] !== Node::CONDITION) {
-                $tData['nextWaiter'] = -1;
-                $this->queue->set((string) $t, $tData);
-                if ($trail === null) {
-                    $this->firstWaiter->set($next);
-                } else {
-                    $trailData = $this->queue->get((string) $trail);
-                    $trailData['nextWaiter'] = $next;
-                    $this->queue->set((string) $trail, $trailData);
-                }
-                if ($next === 0) {
-                    $this->lastWaiter->set($trail);
-                }
-            } else {
-                $trail = $t;
+            if ($next === -1) {
+                $this->firstWaiter->set(-1);
+                $this->lastWaiter->set(-1);
             }
-            $t = $next;
+
+            if (($this->getAndUnsetStatus($fData, AbstractQueuedSynchronizer::COND, false) & AbstractQueuedSynchronizer::COND) !== 0) {
+                $this->synchronizer->enqueue($fData);         
+                if (!$all) {
+                    break;
+                }
+            }
+            $first = $next;
         }
     }
-
-    // public methods
 
     /**
      * Moves the longest-waiting thread, if one exists, from the
@@ -156,12 +179,11 @@ class ConditionObject implements ConditionInterface
      */
     public function signal(?ThreadInterface $thread = null): void
     {
-        if ($thread !== null && !$this->synchronizer->isHeldExclusively($thread)) {
-            throw new \Exception("Illegal monitor state");
-        }
         $first = $this->firstWaiter->get();
-        if ($first !== -1) {
-            $this->doSignal($first);
+        if (!$this->synchronizer->isHeldExclusively($thread)) {
+            throw new \Exception("Illegal monitor state");
+        } elseif ($first !== -1) {    
+            $this->doSignal($first, false);
         }
     }
 
@@ -174,194 +196,195 @@ class ConditionObject implements ConditionInterface
      */
     public function signalAll(?ThreadInterface $thread = null): void
     {
-        if ($thread !== null && !$this->synchronizer->isHeldExclusively($thread)) {
+        $first = $this->firstWaiter->get();
+        if (!$this->synchronizer->isHeldExclusively($thread)) {
+            throw new \Exception("Illegal monitor state");
+        } elseif ($first !== -1) {
+            $this->doSignal($first, true);
+        }
+    }
+
+    /**
+     * Adds node to condition list and releases lock.
+     *
+     * @param node the node
+     * @return savedState to reacquire after wait
+     */
+    private function enableWait(?ThreadInterface $thread = null, array &$node): int
+    {
+        if ($this->synchronizer->isHeldExclusively($thread)) {
+            $node['waiter'] = getmypid();
+            $this->upsertNodeAtomically($node['id'], ['waiter' => $node['waiter']]);
+
+            $this->setStatusRelaxed($node, AbstractQueuedSynchronizer::COND | AbstractQueuedSynchronizer::WAITING);
+            $last = $this->lastWaiter->get();
+            if ($last === -1) {
+                $this->firstWaiter->set($node['id']);
+            } else {
+                $lData = $this->queue->get((string) $last);
+                $lData['nextWaiter'] = $node['id'];                
+                $this->upsertNodeAtomically($last, ['nextWaiter' => $node['id']]);
+            }
+            $this->lastWaiter->set($node['id']);            
+            $savedState = $this->synchronizer->getState();
+
+            if ($this->synchronizer->release($thread, $savedState)) {
+                return $savedState;
+            }
+        }
+        $node['status'] = AbstractQueuedSynchronizer::CANCELLED; // lock not held or inconsistent
+        $this->upsertNodeAtomically($node['id'], ['status' => $node['status']]);
+        throw new \Exception("Illegal monitor state");
+    }
+
+    /**
+     * Returns true if a node that was initially placed on a condition
+     * queue is now ready to reacquire on sync queue.
+     * @param node the node
+     * @return true if is reacquiring
+     */
+    private function canReacquire(?array $node): bool
+    {
+        // check links, not status to avoid enqueue race
+        // traverse unless known to be bidirectionally linked
+        $ret = $node !== null && ($nData = $this->queue->get((string) $node['id'])) !== false && ($p = $nData['prev']) !== -1 && ((($pData = $this->queue->get((string) $p)) !== false && $pData['next'] === $node['id']) || $this->synchronizer->isEnqueued($node));
+        return $ret;
+    }
+
+    /**
+     * Unlinks the given node and other non-waiting nodes from
+     * condition queue unless already unlinked.
+     */
+    private function unlinkCancelledWaiters(?array $node = null): void
+    {
+        if (($node === null) || (($nData = $this->queue->get((string) $node['id'])) !== false && $node['nextWaiter'] !== -1) || $node['id'] === $this->lastWaiter->get()) {
+            $w = $this->firstWaiter->get();
+            $trail = null;
+            while ($w !== -1) {
+                $wData = $this->queue->get((string) $w);
+                $next = $wData['nextWaiter'];
+                if (($wData['status'] & AbstractQueuedSynchronizer::COND) === 0) {
+                    $wData['nextWaiter'] = -1;
+                    $this->upsertNodeAtomically($w, ['nextWaiter' => -1]);
+                    //sync
+                    $shouldBreak = false;
+                    if ($trail === null) {
+                        $this->firstWaiter->set($next);
+                        if ($next === -1) {
+                            $shouldBreak = true;
+                        }
+                    } else {
+                        $trailData = $this->queue->get((string) $trail);
+                        $trailData['nextWaiter'] = $next;
+                        $this->upsertNodeAtomically($trail, ['nextWaiter' => $next]);
+                    }
+                    if ($next === -1) {
+                        $this->lastWaiter->set($trail ?? -1);
+                    }
+                } else {
+                    $trail = $w;
+                }
+                $w = $next;
+            }
+        }
+    }
+
+    /**
+     * Constructs objects needed for condition wait. On OOME,
+     * releases lock, sleeps, reacquires, and returns null.
+     */
+    private function newConditionNode(?ThreadInterface $thread = null): ?array
+    {
+        $savedState = 0;
+        $pid = $thread !== null ? $thread->pid: getmypid();
+
+        if ($this->synchronizer->tryInitializeHead() !== null) {
+            $newNode = ['id' => AbstractQueuedSynchronizer::$nodeCounter->add(), 'next' => -1, 'prev' => -1, 'waiter' => $pid, 'nextWaiter' => -1, 'status' => 0, 'release' => AbstractQueuedSynchronizer::$releaseCounter->get(), 'version' => 0];
+            $this->queue->set((string) $newNode['id'], $newNode);
+            return $newNode;
+        }
+        // fall through if encountered OutOfMemoryError
+        if (!$this->synchronizer->isHeldExclusively($thread) || !$this->synchronizer->release($thread, $savedState = $this->synchronizer->getState())) {
             throw new \Exception("Illegal monitor state");
         }
-        $first = $this->firstWaiter->get();
-        if ($first !== -1) {
-            $this->doSignalAll($first);
-        }
+        LockSupport::parkNanos($thread, self::OOME_COND_WAIT_DELAY);
+        $this->synchronizer->acquireOnOOME($thread, false, $savedState);
+        return null;
+    }
+
+    private function unlinkOutdatedNodes(int $pid): void
+    {
+
     }
 
     /**
      * Implements uninterruptible condition wait.
      * <ol>
-     * <li> Save lock state returned by {@link #getState}.
-     * <li> Invoke {@link #release} with saved state as argument,
-     *      throwing IllegalMonitorStateException if it fails.
-     * <li> Block until signalled.
-     * <li> Reacquire by invoking specialized version of
-     *      {@link #acquire} with saved state as argument.
+     * <li>Save lock state returned by {@link #getState}.
+     * <li>Invoke {@link #release} with saved state as argument,
+     *     throwing IllegalMonitorStateException if it fails.
+     * <li>Block until signalled.
+     * <li>Reacquire by invoking specialized version of
+     *     {@link #acquire} with saved state as argument.
      * </ol>
      */
     public function awaitUninterruptibly(?ThreadInterface $thread = null): void
     {
-        $node = $this->addConditionWaiter($thread);
-        $savedState = $this->synchronizer->fullyRelease($thread);
+        $node = $this->newConditionNode($thread);
+        if ($node === null) {
+            return;
+        }
+        $savedState = $this->enableWait($thread, $node);
+        //LockSupport.setCurrentBlocker(this); // for back-compatibility
         $interrupted = false;
-        $pid = $thread !== null ? $thread->pid : getmypid();
-        while (!$this->synchronizer->isOnSyncQueue($pid)) {
-            LockSupport::park($thread);
-            if ($thread->isInterrupted()) {
+        $rejected = false;
+        $blocker = new NodeBlocker($node, $this);
+        while (!$this->canReacquire($node)) {
+            if ($thread !== null && $thread->isInterrupted()) {
                 $interrupted = true;
+            } elseif (($this->queue->get((string) $node['id'], 'status') & AbstractQueuedSynchronizer::COND) !== 0) {
+                try {
+                    if ($rejected) {
+                        $blocker->block();
+                    } else {
+                        ForkJoinPool::managedBlock($blocker);
+                    }
+                } catch (\Throwable $ex) {
+                    $rejected = true;
+                }/* catch (InterruptedException ie) {
+                    interrupted = true;
+                }*/
+            } else {
+                //Thread.onSpinWait();    // awoke while enqueuing
+                usleep(1);
+                if ($i++ % 10000 === 0) {
+                    fwrite(STDERR, getmypid() . ": await reacquire loop lock takes too much wait cycles [$i]!\n");
+                }
             }
+            $node = $this->queue->get((string) $node['id']);
         }
-        if ($this->synchronizer->acquireQueued($thread, $node, $savedState) || $interrupted) {
-            AbstractQueuedSynchronizer::selfInterrupt($thread);
+        //LockSupport.setCurrentBlocker(null);
+        $this->clearStatus($node);
+        $this->synchronizer->acquire($thread, $node, $savedState, false, false, false, 0);
+        if ($interrupted) {
+            //Thread.currentThread().interrupt();
+            exit(0);
         }
-    }
-
-    /*
-     * For interruptible waits, we need to track whether to throw
-     * InterruptedException, if interrupted while blocked on
-     * condition, versus reinterrupt current thread, if
-     * interrupted while blocked waiting to re-acquire.
-     */
-
-    /** Mode meaning to reinterrupt on exit from wait */
-    private const REINTERRUPT =  1;
-    /** Mode meaning to throw InterruptedException on exit from wait */
-    private const THROW_IE    = -1;
-
-    /**
-     * Checks for interrupt, returning THROW_IE if interrupted
-     * before signalled, REINTERRUPT if after signalled, or
-     * 0 if not interrupted.
-     */
-    private function checkInterruptWhileWaiting(?ThreadInterface $thread = null): int
-    {
-        $pid = $thread !== null ? $thread->pid : getmypid();
-        $node = $this->queue->get((string) $pid);
-        return ($thread !== null && $thread->isInterrupted()) ?
-            ($this->synchronizer->transferAfterCancelledWait($node) ? self::THROW_IE : self::REINTERRUPT) :
-            0;
+        //Differ from JDK22
+        //$this->queue->del((string) $node['id']);
     }
 
     /**
-     * Throws InterruptedException, reinterrupts current thread, or
-     * does nothing, depending on mode.
-     */
-    private function reportInterruptAfterWait(?ThreadInterface $thread = null, int $interruptMode = 0): void
-    {
-        if ($interruptMode == self::THROW_IE) {
-            throw new \Exception("Interrupted");
-        } elseif ($interruptMode == self::REINTERRUPT) {
-            AbstractQueuedSynchronizer::selfInterrupt($thread);
-        }
-    }
-    /**
-     * Implements timed condition wait.
+     * Implements interruptible condition wait.
      * <ol>
-     * <li> If current thread is interrupted, throw InterruptedException.
-     * <li> Save lock state returned by {@link #getState}.
-     * <li> Invoke {@link #release} with saved state as argument,
-     *      throwing IllegalMonitorStateException if it fails.
-     * <li> Block until signalled, interrupted, or timed out.
-     * <li> Reacquire by invoking specialized version of
-     *      {@link #acquire} with saved state as argument.
-     * <li> If interrupted while blocked in step 4, throw InterruptedException.
-     * </ol>
-     */
-    public function awaitNanos(?ThreadInterface $thread = null, int $nanosTimeout = 0): int
-    {
-        if ($thread->isInterrupted()) {
-            throw new \Exception("Interrupted");
-        }
-        $node = $this->addConditionWaiter($thread);
-        $savedState = $this->synchronizer->fullyRelease($thread);
-        $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
-        $interruptMode = 0;
-        $pid = $thread !== null ? $thread->pid : getmypid();
-        while (!$this->synchronizer->isOnSyncQueue($pid)) {
-            if ($nanosTimeout <= 0) {
-                $tData = $this->queue->get((string) $pid);
-                $this->synchronizer->transferAfterCancelledWait($tData);
-                break;
-            }
-            if ($nanosTimeout >= /*spinForTimeoutThreshold*/1000) {
-                LockSupport::parkNanos($thread, $this->synchronizer, $nanosTimeout);
-            }
-            if (($interruptMode = $this->checkInterruptWhileWaiting($thread)) != 0) {
-                break;
-            }
-            $nanosTimeout = $deadline - round(microtime(true)) * 1000;
-        }
-        if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
-            $interruptMode = self::REINTERRUPT;
-        }
-        $queue = $this->synchronizer->getQueue();
-        $nData = $queue->get((string) $pid);
-        if ($nData['nextWaiter'] !== 0) {
-            $this->unlinkCancelledWaiters();
-        }
-        if ($interruptMode != 0) {
-            $this->reportInterruptAfterWait($thread, $interruptMode);
-        }
-        return $deadline - round(microtime(true)) * 1000;
-    }
-
-    /**
-     * Implements absolute timed condition wait.
-     * <ol>
-     * <li> If current thread is interrupted, throw InterruptedException.
-     * <li> Save lock state returned by {@link #getState}.
-     * <li> Invoke {@link #release} with saved state as argument,
-     *      throwing IllegalMonitorStateException if it fails.
-     * <li> Block until signalled, interrupted, or timed out.
-     * <li> Reacquire by invoking specialized version of
-     *      {@link #acquire} with saved state as argument.
-     * <li> If interrupted while blocked in step 4, throw InterruptedException.
-     * <li> If timed out while blocked in step 4, return false, else true.
-     * </ol>
-     */
-    public function awaitUntil(?ThreadInterface $thread = null, \DateTime $deadline = null): bool
-    {
-        $abstime = $deadline->getTime()->getTimestamp();
-        if ($thread->isInterrupted()) {
-            throw new \Exception("Interrupted");
-        }
-        $node = $this->addConditionWaiter($thread);
-        $savedState = $this->synchronizer->fullyRelease($thread);
-        $timedout = false;
-        $interruptMode = 0;
-        $pid = $thread !== null ? $thread->pid : getmypid();
-        while (!$this->synchronizer->isOnSyncQueue($pid)) {
-            if (time() > $abstime) {
-                $tData = $this->queue->get((string) $pid);
-                $timedout = $this->synchronizer->transferAfterCancelledWait($tData);
-                break;
-            }
-            LockSupport::parkUntil($thread, $this->synchronizer, $abstime);
-            if (($interruptMode = $this->checkInterruptWhileWaiting($thread)) != 0) {
-                break;
-            }
-        }
-        if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
-            $interruptMode = self::REINTERRUPT;
-        }
-        $queue = $this->synchronizer->getQueue();
-        $nData = $queue->get((string) $pid);
-        if ($nData['nextWaiter'] !== 0) {
-            $this->unlinkCancelledWaiters();
-        }
-        if ($interruptMode != 0) {
-            $this->reportInterruptAfterWait($thread, $interruptMode);
-        }
-        return !$timedout;
-    }
-
-    /**
-     * Implements timed condition wait.
-     * <ol>
-     * <li> If current thread is interrupted, throw InterruptedException.
-     * <li> Save lock state returned by {@link #getState}.
-     * <li> Invoke {@link #release} with saved state as argument,
-     *      throwing IllegalMonitorStateException if it fails.
-     * <li> Block until signalled, interrupted, or timed out.
-     * <li> Reacquire by invoking specialized version of
-     *      {@link #acquire} with saved state as argument.
-     * <li> If interrupted while blocked in step 4, throw InterruptedException.
-     * <li> If timed out while blocked in step 4, return false, else true.
+     * <li>If current thread is interrupted, throw InterruptedException.
+     * <li>Save lock state returned by {@link #getState}.
+     * <li>Invoke {@link #release} with saved state as argument,
+     *     throwing IllegalMonitorStateException if it fails.
+     * <li>Block until signalled or interrupted.
+     * <li>Reacquire by invoking specialized version of
+     *     {@link #acquire} with saved state as argument.
+     * <li>If interrupted while blocked in step 4, throw InterruptedException.
      * </ol>
      */
     public function await(?ThreadInterface $thread = null, ?int $time = null, ?string $unit = null)
@@ -371,62 +394,233 @@ class ConditionObject implements ConditionInterface
             if ($thread !== null && $thread->isInterrupted()) {
                 throw new \Exception("Interrupted");
             }
-            $node = $this->addConditionWaiter($thread);           
-            $savedState = $this->synchronizer->fullyRelease($thread);
-            $interruptMode = 0;
-            while (!$this->synchronizer->isOnSyncQueue($pid)) {  
-                LockSupport::park($thread/*, $this->synchronizer*/); 
-                if (($interruptMode = $this->checkInterruptWhileWaiting($thread)) != 0)
-                    break;
-            }  
-            if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
-                $interruptMode = self::REINTERRUPT;
+            $node = $this->newConditionNode($thread);            
+
+            if ($node === null) {
+                return;
             }
-            $queue = $this->synchronizer->getQueue();
-            $nData = $queue->get((string) $pid);
-            if ($nData['nextWaiter'] !== 0) {
-                $this->unlinkCancelledWaiters();
+            $idx = hrtime(true);
+            $savedState = $this->enableWait($thread, $node);
+
+            //LockSupport.setCurrentBlocker(this); // for back-compatibility
+            $interrupted = false;
+            $cancelled = false;
+            $rejected = false;
+            $blocker = new NodeBlocker($node, $this);
+            $i = 1;
+            while (!$this->canReacquire($node)) {
+                //@TODO. Probably an error, because do not break! Thread may be null!!!
+                if ($thread !== null && ($interrupted |= $thread->isInterrupted())) {
+                    if ($cancelled = ($this->getAndUnsetStatus($node, AbstractQueuedSynchronizer::COND, false) & AbstractQueuedSynchronizer::COND) !== 0) {
+                        break;// else interrupted after signal
+                    }
+                } elseif (($this->queue->get((string) $node['id'], 'status') & AbstractQueuedSynchronizer::COND) !== 0) {
+                    try {
+                        if ($rejected) {
+                            $blocker->block();
+                        } else {
+                            ForkJoinPool::managedBlock($blocker);
+                        }
+                    } catch (\Throwable $ex) {
+                        $rejected = true;
+                    }/* catch (InterruptedException ie) {
+                        interrupted = true;
+                    }*/
+                } else {
+                    //Thread.onSpinWait();    // awoke while enqueuing
+                    usleep(1);
+                    if ($i++ % 10000 === 0) {
+                        fwrite(STDERR, getmypid() . ": await reacquire loop lock takes too much wait cycles [$i]!\n");
+                    }
+                }
+                $node = $this->queue->get((string) $node['id']);
             }
-            if ($interruptMode != 0) {
-                $this->reportInterruptAfterWait($thread, $interruptMode);
+            //LockSupport.setCurrentBlocker(null);
+            //may be not needed
+            $node = $this->queue->get((string) $node['id']);
+            $this->clearStatus($node);
+            $this->synchronizer->acquire($thread, $node, $savedState, false, false, false, 0);
+            //may be not needed
+            $node = $this->queue->get((string) $node['id']);
+            if ($interrupted) {
+                if ($cancelled) {
+                    $this->unlinkCancelledWaiters($node);
+                    throw new \Exception("Interrupted");
+                }
+                //Thread.currentThread().interrupt();
+                if ($thread !== null) {
+                    $thread->interrupt();
+                } else {
+                    exit(0);
+                }
             }
+            //Differ from JDK22
+            //$this->queue->del((string) $node['id']);
         } else {
             $nanosTimeout = TimeUnit::toNanos($time, $unit);
-            if ($thread->isInterrupted()) {
+            if ($thread !== null && $thread->isInterrupted()) {
                 throw new \Exception("Interrupted");
             }
-            $node = $this->addConditionWaiter($thread);
-            $savedState = $this->synchronizer->fullyRelease($thread);
-            $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
-            $timedout = false;
-            $interruptMode = 0;
-            while (!$this->synchronizer->isOnSyncQueue($pid)) {
-                if ($nanosTimeout <= 0) {
-                    $tData = $this->queue->get((string) $pid);
-                    $timedout = $this->synchronizer->transferAfterCancelledWait($tData);
-                    break;
+            $node = $this->newConditionNode($thread);
+            if ($node === null) {
+                return false;
+            }
+            $savedState = $this->enableWait($thread, $node);
+            $nanos = ($nanosTimeout < 0) ? 0 : $nanosTimeout;
+            $deadline = hrtime(true) + $nanos;
+            $cancelled = false;
+            $interrupted = false;
+            while (!$this->canReacquire($node)) {
+                if (($thread !== null && ($interrupted |= $thread->isInterrupted())) ||
+                    ($nanos = $deadline - hrtime(true)) <= 0) {
+                    if ($cancelled = ($this->getAndUnsetStatus($node, AbstractQueuedSynchronizer::COND, false) & AbstractQueuedSynchronizer::COND) !== 0) {
+                        break;
+                    }
+                } else {
+                    LockSupport::parkNanos($thread, $nanos);
                 }
-                if ($nanosTimeout >= /*spinForTimeoutThreshold*/1000) {
-                    LockSupport::parkNanos($thread, $this->synchronizer, $nanosTimeout);
+                $node = $this->queue->get((string) $node['id']);
+            }
+            $this->clearStatus($node);
+            $this->synchronizer->acquire($thread, $node, $savedState, false, false, false, 0);
+            if ($cancelled) {
+                $this->unlinkCancelledWaiters($node);
+                if ($interrupted) {
+                    throw new \Exception("Interrupted");
                 }
-                if (($interruptMode = $this->checkInterruptWhileWaiting($thread)) != 0) {
-                    break;
+            } elseif ($interrupted) {
+                if ($thread !== null) {
+                    $thread->interrupt();
+                } else {
+                    exit(0);
                 }
-                $nanosTimeout = $deadline - round(microtime(true)) * 1000;
             }
-            if ($this->synchronizer->acquireQueued($thread, $node, $savedState) && $interruptMode != self::THROW_IE) {
-                $interruptMode = self::REINTERRUPT;
-            }
-            $queue = $this->synchronizer->getQueue();
-            $nData = $queue->get((string) $pid);
-            if ($nData['nextWaiter'] !== 0) {
-                $this->unlinkCancelledWaiters();
-            }
-            if ($interruptMode != 0) {
-                $this->reportInterruptAfterWait($thread, $interruptMode);
-            }
-            return !$timedout;
+            return !$cancelled;
         }
+    }
+
+    /**
+     * Implements timed condition wait.
+     * <ol>
+     * <li>If current thread is interrupted, throw InterruptedException.
+     * <li>Save lock state returned by {@link #getState}.
+     * <li>Invoke {@link #release} with saved state as argument,
+     *     throwing IllegalMonitorStateException if it fails.
+     * <li>Block until signalled, interrupted, or timed out.
+     * <li>Reacquire by invoking specialized version of
+     *     {@link #acquire} with saved state as argument.
+     * <li>If interrupted while blocked in step 4, throw InterruptedException.
+     * </ol>
+     */
+    public function awaitNanos(?ThreadInterface $thread = null, int $nanosTimeout = 0): int
+    {
+        if ($thread !== null && $thread->isInterrupted()) {
+            throw new \Exception("Interrupted");
+        }
+        $node = $this->newConditionNode($thread);
+        if ($node === null) {
+            return $nanosTimeout - self::OOME_COND_WAIT_DELAY;
+        }
+        $savedState = $this->enableWait($thread, $node);
+        $nanos = ($nanosTimeout < 0) ? 0 : $nanosTimeout;
+        $deadline = hrtime(true) + $nanos;
+        $cancelled = false;
+        $interrupted = false;
+        while (!$this->canReacquire($node)) {
+            if (($thread !== null && $interrupted |= $thread->isInterrupted()) || ($nanos = $deadline - hrtime(true)) <= 0) {
+                $status = $this->getAndUnsetStatus($node, AbstractQueuedSynchronizer::COND, false) & AbstractQueuedSynchronizer::COND;
+                if ($cancelled = $status !== 0) {
+                    break;
+                }
+            } else {
+                LockSupport::parkNanos($thread, $nanos);
+            }
+            //can be updated in other threads, so get again
+            $node = $this->queue->get((string) $node['id']);
+        }
+        //may be not needed
+        $node = $this->queue->get((string) $node['id']);
+        $this->clearStatus($node);
+        $this->synchronizer->acquire($thread, $node, $savedState, false, false, false, 0); //false, 0
+        //may be not needed
+        
+        $node = $this->queue->get((string) $node['id']);
+        if ($cancelled) {
+            $this->unlinkCancelledWaiters($node);
+            if ($interrupted) {
+                throw new \Exception("Interrupted");
+            }
+        } elseif ($interrupted) {
+            if ($thread !== null) {
+                $thread->interrupt();
+            } else {
+                exit(0);
+            }
+        }
+
+        $remaining = $deadline - hrtime(true); // avoid overflow
+        return ($remaining <= $nanosTimeout) ? $remaining : PHP_INT_MIN;
+    }
+
+    /**
+     * Implements absolute timed condition wait.
+     * <ol>
+     * <li>If current thread is interrupted, throw InterruptedException.
+     * <li>Save lock state returned by {@link #getState}.
+     * <li>Invoke {@link #release} with saved state as argument,
+     *     throwing IllegalMonitorStateException if it fails.
+     * <li>Block until signalled, interrupted, or timed out.
+     * <li>Reacquire by invoking specialized version of
+     *     {@link #acquire} with saved state as argument.
+     * <li>If interrupted while blocked in step 4, throw InterruptedException.
+     * <li>If timed out while blocked in step 4, return false, else true.
+     * </ol>
+     */
+    public function awaitUntil(?ThreadInterface $thread = null, \DateTime $deadline = null): bool
+    {
+        $abstime = $deadline->getTime()->getTimestamp();
+        if ($thread !== null && $thread->isInterrupted()) {
+            throw new \Exception("Interrupted");
+        }
+        $node = $this->newConditionNode($thread);
+        if ($node === null) {
+            return false;
+        }
+        $savedState = $this->enableWait($thread, $node);
+        $cancelled = false;
+        $interrupted = false;
+        while (!$this->canReacquire($node)) {
+            if (($thread !== null && $interrupted |= $thread->isInterrupted()) || time() > $abstime) {
+                if ($cancelled = ($this->getAndUnsetStatus($node, AbstractQueuedSynchronizer::COND, false) & AbstractQueuedSynchronizer::COND) !== 0) {
+                    break;
+                }
+            } else {
+                //@TODO - implement this method, will throw exception now
+                LockSupport::parkUntil($thread, $abstime);
+            }
+            $node = $this->queue->get((string) $node['id']);
+        }
+        //may be not needed
+        $node = $this->queue->get((string) $node['id']);
+        $this->clearStatus($node);
+        $this->synchronizer->acquire($thread, $node, $savedState, false, false, false, 0);
+        //may be not needed
+        $node = $this->queue->get((string) $node['id']);
+        if ($cancelled) {
+            $this->unlinkCancelledWaiters($node);
+            if ($interrupted) {
+                throw new \Exception("Interrupted");
+            }
+        } elseif ($interrupted) {
+            if ($thread !== null) {
+                $thread->interrupt();
+            } else {
+                exit(0);
+            }
+        }
+        //Differ from JDK22
+        //$this->queue->del((string) $node['id']);
+        return !$cancelled;
     }
 
     //  support for instrumentation
@@ -439,7 +633,7 @@ class ConditionObject implements ConditionInterface
      */
     public function isOwnedBy(SynchronizerInterface $sync): bool
     {
-        return $sync == $this;
+        return $this->synchronizer == $this;
     }
 
     /**
@@ -457,7 +651,7 @@ class ConditionObject implements ConditionInterface
         }
         for ($w = $this->firstWaiter->get(); $w !== -1; ) {
             $wData = $this->queue->get((string) $w);
-            if ($wData['waitStatus'] == Node::CONDITION) {
+            if (($wData['status'] & AbstractQueuedSynchronizer::COND) !== 0) {
                 return true;
             }
             $w = $wData['nextWaiter'];
@@ -482,7 +676,7 @@ class ConditionObject implements ConditionInterface
         $n = 0;
         for ($w = $this->firstWaiter->get(); $w !== -1; ) {
             $wData = $this->queue->get((string) $w);
-            if ($wData['waitStatus'] == Node::CONDITION) {
+            if (($wData['status'] & AbstractQueuedSynchronizer::COND) !== 0) {
                 $n += 1;
             }
             $w = $wData['nextWaiter'];
@@ -507,9 +701,9 @@ class ConditionObject implements ConditionInterface
         $list = [];
         for ($w = $this->firstWaiter->get(); $w !== -1; ) {
             $wData = $this->queue->get((string) $w);
-            if ($wData['waitStatus'] == Node::CONDITION) {
-                $t = $wData['pid'];
-                if ($t !== 0) {
+            if (($wData['status'] & AbstractQueuedSynchronizer::COND) !== 0) {
+                $t = $wData['waiter'];
+                if ($t !== 0 && $t !== -1) {
                     $list[] = $t;
                 }
             }

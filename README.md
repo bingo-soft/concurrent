@@ -146,9 +146,6 @@ $pool->shutdown(); //shutdown pool with all processes attached
     assert(45000150000, $result); 
 ```
 
-Warning - ForkJoinPool requires stabilization, need to apply new features from OpenJDK.
-
-
 # Example 4 (CompletableFuture based on multiprocessing)
 
 ```php
@@ -296,6 +293,66 @@ Warning - ForkJoinPool requires stabilization, need to apply new features from O
 
     //future that waits any of the provided futures to complete
     $anyOfFuture = CompletableFuture::anyOf($future1, $future2);
+
+```
+
+# Example 5 (ScheduledPoolExecutor, cycling jobs)
+
+```php
+
+use Concurrent\Executor\ScheduledPoolExecutor;
+
+//create pool with 4 workers (processes)
+$executor = new ScheduledPoolExecutor(4);
+
+$futures = [];
+//15 parallel cycling jobs
+for ($i = 1; $i < 15; $i += 1) {
+    
+    //period in milliseconds
+    $period = rand(3, 15);
+    $future = $executor->scheduleAtFixedRate(function () use ($period) {
+        fwrite(STDERR, getmypid() . ": task executed, period = $period (ms), current time = " . hrtime(true) . " (ns)\n");
+    }, 0, $period, TimeUnit::MILLISECONDS);
+    $futures[] = $future;
+}
+
+//sleep for 10 seconds and cancel execution
+sleep(10);
+foreach ($futures as $future) {
+    $future->cancel(false);
+}
+
+```
+
+# Example 6 (ScheduledPoolExecutor, delayed jobs)
+
+```php
+
+use Concurrent\Executor\ScheduledPoolExecutor;
+
+//create pool with 4 workers (processes)
+$executor = new ScheduledPoolExecutor(4);
+
+$future1 = $executor->schedule(function () {
+    fwrite(STDERR, getmypid() . ": delayed task 1 executed, delay = 100 (ms), current time = " . hrtime(true) . " (ns)\n");
+}, 100, TimeUnit::MILLISECONDS);
+
+$future2 = $executor->schedule(function () {
+    fwrite(STDERR, getmypid() . ": delayed task 2 executed, delay = 100 (ms), current time = " . hrtime(true) . " (ns)\n");
+}, 100, TimeUnit::MILLISECONDS);
+
+$future3 = $executor->schedule(function () {
+    fwrite(STDERR, getmypid() . ": delayed task 3 executed, delay = 200 (ms), current time = " . hrtime(true) . " (ns)\n");
+}, 200, TimeUnit::MILLISECONDS);
+
+$future4 = $executor->schedule(function () {
+    fwrite(STDERR, getmypid() . ": delayed task 4 executed, delay = 200 (ms), current time = " . hrtime(true) . " (ns)\n");
+}, 200, TimeUnit::MILLISECONDS);
+
+$future5 = $executor->schedule(function () {
+    fwrite(STDERR, getmypid() . ": delayed task 5 executed, delay = 1000 (ms), current time = " . hrtime(true) . " (ns)\n");
+}, 1000, TimeUnit::MILLISECONDS);
 
 ```
 

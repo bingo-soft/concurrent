@@ -12,13 +12,4 @@ interface ExecutorInterface
      * @param command the runnable task
      */
     public function execute(RunnableInterface $command): void;
-
-    /**
-     * Creates server socket and binds it to specified port. Socket is used
-     * for inter process communication to share wait and notify signals
-     * (based on PIDS)
-     *
-     * @param socket either url or socket port
-     */
-    //public function listen(int $port): void;
 }

@@ -3,6 +3,7 @@
 namespace Concurrent\Lock;
 
 use Concurrent\ThreadInterface;
+use Concurrent\Executor\ThreadLocalRandom;
 
 abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
 {
@@ -13,6 +14,8 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * CANCELLED.
      */
     public $head;
+
+    public $headNext;
 
     /**
      * Tail of the wait queue, lazily initialized.  Modified only via
@@ -26,7 +29,27 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     private $state;
 
     //Synchronization queue
-    private $queue;
+    public $queue;
+
+    // Condition object, that may have references to the same nodes from synchronization queue
+    private $conditions = [];
+
+    // Node status bits, also used as argument and return values
+    public const WAITING   = 1;          // must be 1
+    public const CANCELLED = -2147483648; // must be negative
+    public const COND      = 2;          // in a condition wait
+
+    public static $nodeCounter;
+
+    // Used to prevent unlkinked nodes piling. Clear by batches of size CLEAN_UP_BATCH_SIZE
+    public static $releaseCounter;
+    public static $lastCleanUp; 
+    public const CLEAN_UP_BATCH_SIZE = 40;
+
+    private $nodeLock;
+
+    //shared with ConditionObject
+    public $operationLock;
 
     /**
      * Creates a new {@code AbstractQueuedSynchronizer} instance
@@ -34,24 +57,43 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     public function __construct()
     {
+        parent::__construct();
         $this->state = new \Swoole\Atomic\Long(0);
 
         $this->head = new \Swoole\Atomic\Long(-1);
         $this->tail = new \Swoole\Atomic\Long(-1);
 
-        $queue = new \Swoole\Table(128); // 128 -> alloc(): mmap(21264) failed, Error: Too many open files in system[23]
-        $queue->column('next', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('prev', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('pid', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('nextWaiter', \Swoole\Table::TYPE_INT, 8);
-        $queue->column('waitStatus', \Swoole\Table::TYPE_INT, 8);
+        $queue = new \Swoole\Table(2048);
+        $queue->column('id', \Swoole\Table::TYPE_INT);
+        $queue->column('next', \Swoole\Table::TYPE_INT);
+        $queue->column('prev', \Swoole\Table::TYPE_INT);
+        $queue->column('waiter', \Swoole\Table::TYPE_INT);
+        //$queue->column('prevWaiter', \Swoole\Table::TYPE_INT);
+        $queue->column('nextWaiter', \Swoole\Table::TYPE_INT);
+        $queue->column('status', \Swoole\Table::TYPE_INT);
+        //0 - exclusive, 1 - shared
+        $queue->column('mode', \Swoole\Table::TYPE_INT, 2);
+        $queue->column('release', \Swoole\Table::TYPE_INT);
+        $queue->column('version', \Swoole\Table::TYPE_INT);
         $queue->create();
         $this->queue = $queue;
+
+        if (self::$nodeCounter === null) {
+            self::$nodeCounter = new \Swoole\Atomic\Long(0);
+
+            self::$releaseCounter = new \Swoole\Atomic\Long(0);
+            self::$lastCleanUp = new \Swoole\Atomic\Long(0);
+
+            self::$testCounter = new \Swoole\Atomic\Long(0);
+        }
+
+        $this->nodeLock = new \Swoole\Atomic\Long(-1);
+        $this->operationLock = new \Swoole\Atomic\Long(-1);
     }
-    
-    public function getQueue(): \Swoole\Table
+
+    public function addCondition(ConditionInterface $condition): void
     {
-        return $this->queue;
+        $this->conditions[] = $condition;
     }
 
     /**
@@ -87,609 +129,483 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     public function compareAndSetState(int $expect, int $update): bool
     {
-        // See below for intrinsics setup to support this
-        if ($this->state->get() == $expect) {
-            $this->state->set($update);
+        return $this->state->cmpset($expect, $update);
+    }
+
+    public function casTail($expect, $update): bool
+    {
+        return $this->tail->cmpset($expect, $update);
+    }
+
+    /**
+     * Tries to CAS a new dummy node for head.
+     * Returns new tail
+     */
+    public function tryInitializeHead(): int
+    {
+        for ($h = null;;) {
+            if (($t = $this->tail->get()) !== -1) {
+                return $t;
+            } elseif ($this->head->get() !== -1) {
+                //Thread.onSpinWait();
+                usleep(1);
+            } else {
+                if ($h === null) {
+                    $h = self::$nodeCounter->add();
+                    //Create Dummy node
+                    $newNode = ['id' => $h, 'next' => -1, 'prev' => -1, 'waiter' => -1, 'nextWaiter' => -1, 'status' => 0, 'version' => 0];
+                    $this->queue->set((string) $h, $newNode);
+                }
+                if ($this->head->cmpset(-1, $h)) {
+                    $this->tail->set($h);
+                    return $h;
+                }
+            }
+        }
+    }
+
+    public function casPrev(array &$node, int $c, int $v): bool
+    {
+        if (($node = $this->queue->get((string) $node['id'])) !== false && $node['prev'] === $c) {
+            $this->upsertNodeAtomically($node['id'], ['prev' => $v]);            
             return true;
-        }        
+        }
         return false;
     }
 
-    // Queuing utilities
-
-    /**
-     * The number of nanoseconds for which it is faster to spin
-     * rather than to use timed park. A rough estimate suffices
-     * to improve responsiveness with very short timeouts.
-     */
-    static $spinForTimeoutThreshold = 1000;
-
-    /**
-     * Inserts node into queue, initializing if necessary. See picture above.
-     * @param node the node to insert
-     * @return node's predecessor
-     */
-    public function enq(array &$node): int
+    public function casNext(array &$node, int $c, int $v): bool
     {
-        for (;;) {            
-            $t = $this->tail->get();
-            if ($t === -1) { // Must initialize
-                if ($this->initHead()) {
-                    $this->queue->set((string) $this->head->get(), ['next' => -1, 'prev' => -1, 'pid' => 0, 'nextWaiter' =>  -1, 'waitStatus' => 0]);
-                    $this->tail->set($this->head->get());
-                }
-            } else {
-                $pid = $node['pid'];                
-                $node['prev'] = $t;
-                $this->queue->set((string) $pid, $node);
-                if ($this->compareAndSetTail($t, $node['pid'])) {
-                    $tailData = $this->queue->get((string) $t);
-                    $tailData['next'] = $pid;
-                    $this->queue->set((string) $t, $tailData);
-                    return $t;
-                }
+        if (($node = $this->queue->get((string) $node['id'])) !== false && $node['next'] === $c) {
+            $this->upsertNodeAtomically( $node['id'], ['next' => $v]);  
+            return true;
+        }
+        return false;
+    }
+
+    public function getAndUnsetStatus(array &$node, int $v): int
+    {        
+        $status = $this->queue->get((string) $node['id'], 'status');
+        $this->upsertNodeAtomically($node['id'], ['status' => $status & (~$v)]);
+        return $status;        
+    }
+
+    public function syncExternalNode(int $id, array $values): void
+    {        
+        if ($this->queue->exists((string) $id)) {
+            $newNode = $this->queue->get($id);
+            foreach ($values as $key => $value) {
+                $newNode[$key] = $value;
             }
+            $newNode['version'] = $newNode['version'] + 1;
+            $this->queue->set($newNode['id'], $newNode);
+        }
+        //$this->upsertNodeAtomically($id, $values, null, false, true);
+    }
+
+    public function syncConditionNode(int $id, array $values): void
+    {
+        foreach ($this->conditions as $condition) {
+            $condition->syncExternalNode($id, $values);  
         }
     }
 
     /**
-     * Creates and enqueues node for current thread and given mode.
-     *
-     * @param mode 1 for exclusive, 2 for shared
+     * Enqueues the node unless null. (Currently used only for
+     * ConditionNodes; other cases are interleaved with acquires.)
      */
-    private function addWaiter(?ThreadInterface $thread = null, int $mode = 0)
+    public function enqueue(?array $node): void
     {
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        if ($mode == 1) {
-            $nData = ['next' => -1, 'prev' => -1, 'pid' => $pid, 'nextWaiter' => -1, 'waitStatus' => 0];
-        } else {
-            $nData = ['next' => -1, 'prev' => -1, 'pid' => $pid, 'nextWaiter' => 0, 'waitStatus' => 0];
-        }
-        $this->queue->set((string) $pid, $nData);
-        // Try the fast path of enq; backup to full enq on failure
-        $pred = $this->tail;
-        if ($pred->get() !== -1) {
-            $nData['prev'] = $pred->get();
-            if ($this->compareAndSetTail($pred->get(), $pid)) {
-                $predData = $this->queue->get((string) $pred->get());
-                $predData['next'] = $pid;
-                $this->queue->set((string) $pred->get(), $predData);
-                return $nData;
-            }
-        }
-        $this->enq($nData);
-        return $nData;
-    }
-
-    /**
-     * Sets head of queue to be node, thus dequeuing. Called only by
-     * acquire methods.  Also nulls out unused fields for sake of GC
-     * and to suppress unnecessary signals and traversals.
-     *
-     * @param node the node
-     */
-    private function setHead(int $node): void
-    {
-        $nData = $this->queue->get((string) $node);
-        $this->queue->del((string) $node);
-        $this->head->set(0);
-
-        $next = $nData['next'];
-
-        if ($this->tail->get() == $node) {
-            $this->tail->set(0);
-            $next = -1;
-        } else {
-            $nextData = $this->queue->get((string) $next);
-            $nextData['prev'] = $nData['prev'];
-            $this->queue->set((string) $next, $nextData);
-        }
-        //@TODO. Check of setting nextWaiter and waitStatus
-        $this->queue->set((string) $this->head->get(), ['next' => $next, 'prev' => -1, 'pid' => 0, 'nextWaiter' =>  $nData['nextWaiter'], 'waitStatus' => $nData['waitStatus']]);
-    }
-
-    /**
-     * Wakes up node's successor, if one exists.
-     *
-     * @param node the node
-     */
-    private function unparkSuccessor(int $node): void
-    {
-        /*
-         * If status is negative (i.e., possibly needing signal) try
-         * to clear in anticipation of signalling.  It is OK if this
-         * fails or if status is changed by waiting thread.
-         */
-        $nData = $this->queue->get((string) $node);
-        $ws = $nData['waitStatus'];
-        if ($ws < 0) {
-            $this->compareAndSetWaitStatus($nData, $ws, 0);
-        }
-
-        /*
-         * Thread to unpark is held in successor, which is normally
-         * just the next node.  But if cancelled or apparently null,
-         * traverse backwards from tail to find the actual
-         * non-cancelled successor.
-         */
-        $s = $nData['next'];
-        $sData = $this->queue->get((string) $s);
-        if ($sData === false || $sData['waitStatus'] > 0) {
-            $s = null;
-            for ($t = $this->tail->get(); $t !== -1 && $t != $nData['pid']; $t = ($this->queue->get((string) $t, 'prev')) ) {
-                $tData = $this->queue->get((string) $t);
-                if ($tData['waitStatus'] <= 0) {
-                    $s = $t;
-                }
-            }
-        }
-        if ($s !== null) {
-            LockSupport::unpark($s);
-        }
-    }
-
-    /**
-     * Release action for shared mode -- signals successor and ensures
-     * propagation. (Note: For exclusive mode, release just amounts
-     * to calling unparkSuccessor of head if it needs signal.)
-     */
-    private function doReleaseShared(): void
-    {
-        /*
-         * Ensure that a release propagates, even if there are other
-         * in-progress acquires/releases.  This proceeds in the usual
-         * way of trying to unparkSuccessor of head if it needs
-         * signal. But if it does not, status is set to PROPAGATE to
-         * ensure that upon release, propagation continues.
-         * Additionally, we must loop in case a new node is added
-         * while we are doing this. Also, unlike other uses of
-         * unparkSuccessor, we need to know if CAS to reset status
-         * fails, if so rechecking.
-         */
-        for (;;) {
-            $h = $this->head;
-            if ($h->get() !== -1 && $h->get() !== $this->tail->get()) {
-                $hData = $this->queue->get((string) $h->get());
-                $ws = $hData['waitStatus'];
-                if ($ws == Node::SIGNAL) {
-                    if (!$this->compareAndSetWaitStatus($hData, Node::SIGNAL, 0)) {
-                        continue;            // loop to recheck cases
+        if ($node !== null) {
+            $unpark = false;
+            //@TODO. Check this difference with JDK22. We see, that waiter may be -1
+            try {
+                for (;;) {
+                    $i = 1;
+                    while ($this->operationLock->get() !== -1) {
+                        usleep(1);
+                        if ($i++ % 10000 === 0) {
+                            fwrite(STDERR, getmypid() . ": node enqueue takes too much wait cycles [$i]!\n");
+                        }
                     }
-                    $this->unparkSuccessor($h->get());
-                } elseif ($ws === 0 && !$this->compareAndSetWaitStatus($hData, $ws, Node::PROPAGATE)) {
-                    continue;                // loop on failed CAS
-                }
-            }
-            if ($h->get() == $this->head->get()) { // loop if head changed
-                break;
-            }
-        }
-    }
+                    if ($this->operationLock->cmpset(-1, getmypid())) {   
+                        if (($t = $this->tail->get()) === -1 && ($t = $this->tryInitializeHead()) === null) {
+                            $unpark = true;             // wake up to spin on OOME
+                            $this->operationLock->cmpset(getmypid(), -1);
+                            break;
+                        }
+                        $this->upsertNodeAtomically($node['id'], ['prev' => $t], $node);
 
-    /**
-     * Sets head of queue, and checks if successor may be waiting
-     * in shared mode, if so propagating if either propagate > 0 or
-     * PROPAGATE status was set.
-     *
-     * @param node the node
-     * @param propagate the return value from a tryAcquireShared
-     */
-    private function setHeadAndPropagate(int $node, int $propagate): void
-    {
-        $h = $this->head; // Record old head for check below
-        $hData = $this->queue->get((string) $h->get());
-        $this->setHead($node);
-        /*
-         * Try to signal next queued node if:
-         *   Propagation was indicated by caller,
-         *     or was recorded (as h.waitStatus either before
-         *     or after setHead) by a previous operation
-         *     (note: this uses sign-check of waitStatus because
-         *      PROPAGATE status may transition to SIGNAL.)
-         * and
-         *   The next node is waiting in shared mode,
-         *     or we don't know, because it appears null
-         *
-         * The conservatism in both of these checks may cause
-         * unnecessary wake-ups, but only when there are multiple
-         * racing acquires/releases, so most need signals now or soon
-         * anyway.
-         */
-        if ($propagate > 0 || $h->get() == -1 || $hData['waitStatus'] < 0 ||
-            ($h = $this->head)->get() == -1 || ($hData = $this->queue->get((string) $h->get()))['waitStatus'] < 0) {
-            $nData = $this->queue->get((string) $node);
-            $s = $nData['next'];
-            if ($s == 0) {
-                $this->doReleaseShared();
-            } else {
-                $sData = $this->queue->get((string) $h->get());
-                if ($sData !== false) {
-                    //Check if is shared
-                    $n = $sData['nextWaiter'];
-                    $nData = $this->queue->get((string) $n);
-                    //nextWaiter -> empty Node()
-                    if ($nData !== false && $nData['pid'] == 0 && $nData['waitStatus'] == 0 && $nData['nextWaiter'] == 0) {
-                        $this->doReleaseShared();
+                        if ($this->casTail($t, $node['id'])) {
+                            $this->upsertNodeAtomically($t, ['next' => $node['id']]);  
+                            $tData = $this->queue->get((string) $t);
+                            if ($tData['status'] < 0) { // wake up to clean link
+                                $unpark = true;
+                            }
+                            break;
+                        }
                     }
                 }
+            } finally {
+                $this->operationLock->cmpset(getmypid(), -1);
+            }
+            if ($unpark) {
+                LockSupport::unpark($node['waiter']);
             }
         }
     }
 
-    // Utilities for various versions of acquire
+    /** Returns true if node is found in traversal from tail */
+    public function isEnqueued(array $node): bool
+    {
+        for ($t = $this->tail->get(); $t !== -1; ) {
+            if ($t === $node['id']) {
+                return true;
+            }
+            $tData = $this->queue->get((string) $t);
+            $t = $tData['prev'];
+        }
+        return false;
+    }
+
+    /**
+     * Wakes up the successor of given node, if one exists, and unsets its
+     * WAITING status to avoid park race. This may fail to wake up an
+     * eligible thread when one or more have been cancelled, but
+     * cancelAcquire ensures liveness.
+     */
+    public function signalNext(int $h): void
+    {
+        if ($h !== -1 && ($hData = $this->queue->get((string) $h)) !== false && ($s = $hData['next']) !== -1 && ($sData = $this->queue->get((string) $s)) !== false && $sData['status'] !== 0) {
+            $this->getAndUnsetStatus($sData, self::WAITING);                    
+            LockSupport::unpark($sData['waiter']);
+        }
+    }
+
+    /** Wakes up the given node if in shared mode */
+    private function signalNextIfShared(int $h): void
+    {
+        if ($h !== -1 && ($hData = $this->queue->get((string) $h)) !== false && ($s = $hData['next']) !== -1 && ($sData = $this->queue->get((string) $s)) !== false && $sData['mode'] === 1 && $sData['status'] !== 0) {
+            $this->getAndUnsetStatus($s, self::WAITING);
+            LockSupport::unpark($sData['waiter'], hrtime(true));
+        }
+    }
+
+    /**
+     * Main acquire method, invoked by all exported acquire methods.
+     *
+     * @param node null unless a reacquiring Condition
+     * @param arg the acquire argument
+     * @param shared true if shared mode else exclusive
+     * @param interruptible if abort and return negative on interrupt
+     * @param timed if true use timed waits
+     * @param time if timed, the System.nanoTime value to timeout
+     * @return positive if acquired, 0 if timed out, negative if interrupted
+     */
+    public function acquire(?ThreadInterface $thread, array | int &$node = null, ?int $arg = null, bool $shared = false, bool $interruptible = false, bool $timed = false, int $time = 0)
+    {
+        $pid = $thread !== null ? $thread->pid : getmypid();
+        if ($arg === null) {
+            $arg = $node;
+            if (!$this->tryAcquire($thread, $arg)) {
+                $node = null;
+                $this->acquire($thread, $node, $arg, false, false, false, 0);
+            }
+        } else {
+            //byte fields, so adjust
+            $spins = 0;
+            $postSpins = 0;   // retries upon unpark of first thread
+            $interrupted = false;
+            $first = false;
+            $pred = -1;               // predecessor of node when enqueued
+            /*
+            * Repeatedly:
+            *  Check if node now first
+            *    if so, ensure head stable, else ensure valid predecessor
+            *  if node is first or not yet enqueued, try acquiring
+            *  else if queue is not initialized, do so by attaching new header node
+            *     resort to spinwait on OOME trying to create node
+            *  else if node not yet created, create it
+            *     resort to spinwait on OOME trying to create node
+            *  else if not yet enqueued, try once to enqueue
+            *  else if woken from park, retry (up to postSpins times)
+            *  else if WAITING status not set, set and retry
+            *  else park and clear WAITING status, and check cancellation
+            */
+            if ($node !== null && $this->queue->get((string) $node['id']) === false) {
+                $this->queue->set((string) $node['id'], $node);
+            }
+            $j = 1;
+            for (;;) {                
+                if (!$first && ($pred = ($node === null) ? null :  (($node = $this->queue->get((string) $node['id'])) !== false ? $node['prev'] : null)  ) !== null && $pred !== -1 && !($first = ($this->head->get() === $pred))) {
+                    $pData = $this->queue->get((string) $pred);
+                    if ($pData['status'] < 0) {
+                        $this->cleanQueue($thread);  // predecessor cancelled
+                        continue;
+                    } elseif ($pData['prev'] === -1) {
+                        usleep(1);                   
+                        continue;
+                    }
+                }                
+                if ($first || $pred === null || $pred === -1) {
+                    $acquired = false;
+                    try {              
+                        if ($shared) {
+                            $acquired = ($this->tryAcquireShared($thread, $arg) >= 0);
+                        } else {
+                            $acquired = $this->tryAcquire($thread, $arg);
+                        }                        
+                    } catch (\Throwable $ex) {
+                        $this->cancelAcquire($thread, $node, $interrupted, false);
+                        throw $ex;
+                    }
+                    if ($node !== null) {
+                        $node = $this->queue->get((string) $node['id']);
+                    }
+                    if ($acquired) { //removal from synchronization queue
+                        if ($first) {                            
+                            $this->upsertNodeAtomically($node['id'], ['prev' => -1, 'waiter' => -1]);
+                            $this->head->set($node['id']);
+                           
+                            $pData = $this->queue->get((string) $pred);
+                            $pData['next'] = -1;                            
+                            $this->syncConditionNode($pred, ['next' => -1]);
+
+                            $this->queue->del((string) $pred);
+                            if ($shared) {
+                                $this->signalNextIfShared($thread, $node['id']);
+                            }
+                            if ($interrupted && $thread !== null) {
+                                $thread->interrupt();
+                            }
+                        }
+                        return 1;
+                    }
+                }
+                if ($node !== null) {
+                    $node = $this->queue->get($node['id']);
+                }
+                if (($t = $this->tail->get()) === -1) {           // initialize queue
+                    if ($this->tryInitializeHead() === null) {
+                        return $this->acquireOnOOME($thread, $shared, $arg);
+                    }
+                } elseif ($node === null) { // allocate; retry before enqueue                    
+                    if ($shared) {
+                        $node = ['id' => self::$nodeCounter->add(), 'next' => -1, 'prev' => -1, 'waiter' => $pid, 'nextWaiter' => -1, 'status' => 0, 'mode' => 1, 'release' => self::$releaseCounter->get(), 'version' => 0];
+                    } else {
+                        $node = ['id' => self::$nodeCounter->add(), 'next' => -1, 'prev' => -1, 'waiter' => $pid, 'nextWaiter' => -1, 'status' => 0, 'mode' => 0, 'release' => self::$releaseCounter->get(), 'version' => 0];
+                    }
+
+                    $this->queue->set((string) $node['id'], $node);
+                } elseif ($pred === null || $pred === -1) {          // try to enqueue
+                    try {
+                        while (true) {
+                            $i = 1;
+                            while ($this->operationLock->get() !== -1) {
+                                usleep(1);
+                                if ($i++ % 10000 === 0) {
+                                    fwrite(STDERR, getmypid() . ": setting node prev and wait fields takes too much wait cycles [$i]!\n");
+                                }
+                            }
+                            if ($this->operationLock->cmpset(-1, getmypid())) {
+                                $this->upsertNodeAtomically($node['id'], ['prev' => $t, 'waiter' => $pid], $node);
+                                if (!$this->casTail($t, $node['id'])) {
+                                    // back out, set to null .  
+                                    $this->upsertNodeAtomically($node['id'], ['prev' => -1]);                  
+                                } else {
+                                    $this->upsertNodeAtomically($t, ['next' => $node['id']]);                   
+                                }
+                                break;
+                            }
+                        }
+                    } finally {
+                        $this->operationLock->cmpset(getmypid(), -1);
+                    }
+                    
+                } elseif ($first && $spins !== 0) {
+                    $spins = ThreadLocalRandom::intToByte(--$spins);                        // reduce unfairness on rewaits
+                    usleep(1);
+                    if ($j++ % 10000 === 0) {
+                        fwrite(STDERR, getmypid() . ": acquiring lock takes too much wait cycles [$j]!\n");
+                    }
+                } elseif ($node['status'] === 0) {
+                    $this->upsertNodeAtomically($node['id'], ['status' => self::WAITING]);
+                } else {
+                    $postSpins = ThreadLocalRandom::intToByte(($postSpins << 1) | 1);
+                    $spins = $postSpins;
+                    if (!$timed) {                        
+                        LockSupport::park($thread);
+                    } elseif (($nanos = $time - hrtime(true)) > 0) {
+                        LockSupport::parkNanos($thread, $nanos);
+                    } else {
+                        break;
+                    }
+                    //@TODO. Differ from JDK, because node could be changed in another process
+                    $node = $this->queue->get((string) $node['id']);
+                    $this->upsertNodeAtomically($node['id'], ['status' => 0]);
+                    if ($thread !== null && ($interrupted |= $thread->isInterrupted()) && $interruptible) {
+                        break;
+                    }
+                }
+            }
+            return $this->cancelAcquire($thread, $node, $interrupted, $interruptible);
+        }
+    }
+
+    private function upsertNodeAtomically(int $id, array $values, ?array $newNode = null, bool $sync = true, bool $updateIfExists = false): void
+    {
+        if ($updateIfExists && !$this->queue->exists((string) $id)) {
+            return;
+        }
+        try {
+
+            $retry = false;
+            while (true) {
+                $i = 1;
+                while ($this->nodeLock->get() !== -1 && !(($op = $this->operationLock->get()) === -1 || $op === getmypid())) {
+                    usleep(1);
+                    if ($i++ % 10000 === 0) {
+                        fwrite(STDERR, getmypid() . ": updating sync node takes too much wait cycles [$i]!\n");
+                    }
+                }
+                if ($this->nodeLock->cmpset(-1, $id) || $retry) {
+                    $retry = false;
+                    if ($newNode !== null && !$this->queue->exists((string) $id)) {
+                        foreach ($values as $key => $value) {
+                            $newNode[$key] = $value;
+                        }
+                        $this->queue->set($id, $newNode);
+                        if ($sync) {
+                            $this->syncConditionNode($id, $values);
+                        }
+                    } else {    
+                        $newNode = $this->queue->get((string) $id);
+                        foreach ($values as $key => $value) {
+                            $newNode[$key] = $value;
+                        }
+                        $newNode['version'] = $newNode['version'] + 1;
+
+                        $this->queue->set($id, $newNode);
+                        if ($sync) {
+                            $this->syncConditionNode($id, $values);
+                        }
+                    }                    
+                    $newNode = $this->queue->get((string) $id);
+                    foreach ($values as $key => $value) {
+                        if ($newNode[$key] !== $value) {
+                            $retry = true;
+                            continue 2;
+                        }
+                    }
+                    break;
+                }
+                continue;
+            }
+        } finally {
+            $this->nodeLock->cmpset($id, -1);
+        }
+        
+    }
+
+    /**
+     * Spin-waits with backoff; used only upon OOME failures during acquire.
+     */
+    public function acquireOnOOME(?ThreadInterface $thread, bool $shared, int $arg): int
+    {
+        for ($nanos = 1;;) {
+            if ($shared ? ($this->tryAcquireShared($thread, $arg) >= 0) : $this->tryAcquire($thread, $arg)) {
+                return 1;
+            }
+            LockSupport::parkNanos($thread, $nanos);               // must use Unsafe park to sleep
+            if ($nanos < (1 << 30))  {             // max about 1 second
+                $nanos <<= 1;
+            }
+        }
+    }
+
+    /**
+     * Possibly repeatedly traverses from tail, unsplicing cancelled
+     * nodes until none are found. Unparks nodes that may have been
+     * relinked to be next eligible acquirer.
+     */
+    private function cleanQueue(?ThreadInterface $thread): void
+    {
+        try {
+            for (;;) {
+                // restart point
+                $i = 1;         
+                while ($this->operationLock->get() !== -1) {
+                    usleep(1);
+                    if ($i++ % 10000 === 0) {
+                        fwrite(STDERR, getmypid() . ": waiting operation lock takes too much wait cycles [$i]!\n");
+                    }
+                }
+                if ($this->operationLock->cmpset(-1, getmypid())) {
+                    for ($q = $this->tail->get(), $s = null;;) { // (p, q, s) triples
+                        if ($q === -1 || (($qData = $this->queue->get((string) $q)) !== false && ($p = $qData['prev']) === -1)) {
+                            return;                      // end of list
+                        }
+                        if ($s === null ? $this->tail->get() !== $q : (($sData = $this->queue->get((string) $s)) !== false && ($sData['prev'] !== $q || $sData['status'] < 0))) {
+                            break;                       // inconsistent
+                        }
+                        $pData = $this->queue->get((string) $p);
+                        if ($qData['status'] < 0) {              // cancelled
+                            if (($s === null ? $this->casTail($q, $p) : $this->casPrev($sData, $q, $p)) && $qData['prev'] === $p) {
+                                $this->casNext($pData, $q, $s ?? -1);         // OK if fails   
+                                if ($pData['prev'] === -1) {
+                                    $this->signalNext($p);
+                                }
+                            }
+                            break;
+                        }
+                        if (($n = $pData['next']) !== $q) {         // help finish
+                            if ($n !== -1 && $qData['prev'] === $p) {
+                                $this->casNext($pData, $n, $q);
+                                if ($pData['prev'] === -1) {
+                                    $this->signalNext($p);
+                                }
+                            }
+                            break;
+                        }
+                        $s = $q;
+                        $q = $qData['prev'];
+                    }
+                    break;
+                }            
+            }
+        } finally {
+            $this->operationLock->cmpset(getmypid(), -1);
+        }
+    }
 
     /**
      * Cancels an ongoing attempt to acquire.
      *
-     * @param node the node
+     * @param node the node (may be null if cancelled before enqueuing)
+     * @param interrupted true if thread interrupted
+     * @param interruptible if should report interruption vs reset
      */
-    private function cancelAcquire(?int $node): void
+    private function cancelAcquire(?ThreadInterface $thread, ?array &$node, bool $interrupted, bool $interruptible): int
     {
-        // Ignore if node doesn't exist
-        if ($node === null) {
-            return;
-        }
-
-        // Skip cancelled predecessors
-        $nodeData = $this->queue->get((string) $node);
-        $pred = $nodeData['prev'];
-        $predData = $this->queue->get((string) $pred);        
-        while ($predData['waitStatus'] > 0) {
-            $pred = $predData['prev'];
-
-            $nodeData['prev'] = $pred;
-            $this->queue->set((string) $node, $nodeData);
-
-            $nData = $this->queue->get((string) $pred);
-        }
-        // predNext is the apparent node to unsplice. CASes below will
-        // fail if not, in which case, we lost race vs another cancel
-        // or signal, so no further action is necessary.
+        if ($node !== null && $node !== -1) {
+            $this->upsertNodeAtomically($node['id'], ['waiter' => -1, 'next' => -1, 'status' => self::CANCELLED]);
  
-        $predNext = $this->queue->get((string) $pred, 'next');
-
-        // Can use unconditional write instead of CAS here.
-        // After this atomic step, other Nodes can skip past us.
-        // Before, we are free of interference from other threads.
-        $nodeData['waitStatus'] = Node::CANCELLED;
-        $this->queue->set((string) $node, $nodeData);
-
-        // If we are the tail, remove ourselves.
-        if ($node == $this->tail->get() && $this->compareAndSetTail($node, $pred)) {
-            $this->compareAndSetNext($pred, $predNext, null);
-        } else {
-            // If successor needs signal, try to set pred's next-link
-            // so it will get one. Otherwise wake it up to propagate.
-            $ws = null;
-            if ($pred != $this->head->get() &&
-                (($ws = $this->queue->get((string) $pred, 'waitStatus')) == Node::SIGNAL ||
-                 ($ws <= 0 && $this->compareAndSetWaitStatus($predData, $ws, Node::SIGNAL))) &&
-                 $this->queue->get((string) $pred, 'pid') !== 0) {
-                $next = $nodeData['next'];
-                if ($next !== 0 && $this->queue->get((string) $next, 'waitStatus') <= 0) {
-                    $this->compareAndSetNext($pred, $predNext, $next);
-                }
+            $node = $this->queue->get((string) $node['id']);
+            if ($node['prev'] !== -1) {
+                $this->cleanQueue($thread);
+            }
+        }
+        if ($interrupted) {
+            if ($interruptible) {
+                return self::CANCELLED;
             } else {
-                $this->unparkSuccessor($node);
-            }
-
-            //node.next = node;
-            $nodeData = $this->queue->get((string) $node);
-            $nodeData['next'] = $node;
-            $this->queue->set((string) $node, $nodeData);      
-        }
-    }
-
-    /**
-     * Checks and updates status for a node that failed to acquire.
-     * Returns true if thread should block. This is the main signal
-     * control in all acquire loops.  Requires that pred == node.prev.
-     *
-     * @param pred node's predecessor holding status
-     * @param node the node
-     * @return {@code true} if thread should block
-     */
-    private function shouldParkAfterFailedAcquire(int $pred, int $node): bool
-    {
-        $pData = $this->queue->get((string) $pred);
-        $nData = $this->queue->get((string) $node);
-        $ws = $pData['waitStatus'];
-        if ($ws == Node::SIGNAL) {
-            /*
-             * This node has already set status asking a release
-             * to signal it, so it can safely park.
-             */
-            return true;
-        }
-        if ($ws > 0) {
-            /*
-             * Predecessor was cancelled. Skip over predecessors and
-             * indicate retry.
-             */
-            do {
-                $pred = $pData['prev'];
-                $nData['prev'] = $pred;
-                $this->queue->set((string) $node, $nData);
-                $pData = $this->queue->get((string) $pred);
-            } while ($pData['waitStatus'] > 0);
-            $pData['next'] = $node;
-            $this->queue->set((string) $pData['pid'], $nData);
-        } else {
-            /*
-             * waitStatus must be 0 or PROPAGATE.  Indicate that we
-             * need a signal, but don't park yet.  Caller will need to
-             * retry to make sure it cannot acquire before parking.
-             */
-            $this->compareAndSetWaitStatus($pData, $ws, Node::SIGNAL);
-        }
-        return false;
-    }
-
-    /**
-     * Convenience method to interrupt current thread.
-     */
-    public static function selfInterrupt(?ThreadInterface $thread = null): void
-    {
-        $thread->interrupt();
-    }
-
-    /**
-     * Convenience method to park and then check if interrupted
-     *
-     * @return {@code true} if interrupted
-     */
-    private function parkAndCheckInterrupt(?ThreadInterface $thread = null): bool
-    {
-        LockSupport::park($thread/*, $this*/);
-        return $thread !== null ? $thread->isInterrupted() : false;
-    }
-
-    /*
-     * Various flavors of acquire, varying in exclusive/shared and
-     * control modes.  Each is mostly the same, but annoyingly
-     * different.  Only a little bit of factoring is possible due to
-     * interactions of exception mechanics (including ensuring that we
-     * cancel if tryAcquire throws exception) and other control, at
-     * least not without hurting performance too much.
-     */
-
-    /**
-     * Acquires in exclusive uninterruptible mode for thread already in
-     * queue. Used by condition wait methods as well as acquire.
-     *
-     * @param node the node
-     * @param arg the acquire argument
-     * @return {@code true} if interrupted while waiting
-     */
-    public function acquireQueued(?ThreadInterface $thread = null, array $node = [], int $arg = 0): bool
-    {
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            $interrupted = false;
-            for (;;) {
-                $predData = $this->queue->get((string) $pid);
-                $p = $predData['prev'];
-                if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($pid);
-                    $failed = false;
-                    return $interrupted;
+                if ($thread !== null) {
+                    $thread->interrupt();
+                } else {
+                    exit(0);
                 }
-                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
-                    $interrupted = true;
-                }
-            }
-        } finally {
-            if ($failed) {
-                $this->cancelAcquire($pid);
             }
         }
-    }
-
-    /**
-     * Acquires in exclusive interruptible mode.
-     * @param arg the acquire argument
-     */
-    private function doAcquireInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
-    {
-        $this->addWaiter($thread, 1);
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            for (;;) {
-                $nData = $this->queue->get((string) $pid);  
-                $p = $nData['prev'];
-                if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($pid);
-                    //$pData = $this->queue->get((string) $p);
-                    //$pData['next'] = -1;
-                    //$this->queue->set((string) $p, $pData);  
-                    $failed = false;                    
-                    return;
-                }
-                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
-                    throw new \Exception("Interrupted");
-                }
-            }
-        } finally {
-            if ($failed) {
-                $this->cancelAcquire($pid);
-            }
-        }
-    }
-
-    /**
-     * Acquires in exclusive timed mode.
-     *
-     * @param arg the acquire argument
-     * @param nanosTimeout max wait time
-     * @return {@code true} if acquired
-     */
-    private function doAcquireNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
-    {
-        if ($nanosTimeout <= 0) {
-            return false;
-        }
-        $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
-        $this->addWaiter($thread, 1);
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            for (;;) {
-                $nData = $this->queue->get((string) $pid);  
-                $p = $nData['prev'];
-                if ($p == $this->head->get() && $this->tryAcquire($thread, $arg)) {
-                    $this->setHead($pid);
-                    //$pData = $this->queue->get((string) $p);
-                    //$pData['next'] = -1;
-                    //$this->queue->set((string) $p, $pData);
-                    $failed = false;
-                    return true;
-                }
-                $nanosTimeout = $deadline - round(microtime(true)) * 1000;
-                if ($nanosTimeout <= 0) {
-                    return false;
-                }
-                if ($this->shouldParkAfterFailedAcquire($p, $pid) &&
-                    $nanosTimeout > self::$spinForTimeoutThreshold) {
-                    LockSupport::parkNanos($thread, $this, $nanosTimeout);
-                }
-                if ($thread->isInterrupted()) {
-                    throw new \Exception("Interrupted");
-                }
-            }
-        } finally {
-            if ($failed) {
-                $this->cancelAcquire($pid);
-            }
-        }
-    }
-
-    /**
-     * Acquires in shared uninterruptible mode.
-     * @param arg the acquire argument
-     */
-    private function doAcquireShared(?ThreadInterface $thread = null, int $arg = 0): void
-    {
-        $this->addWaiter($thread, 2);
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            $interrupted = false;
-            for (;;) {
-                $nData = $this->queue->get((string) $pid);  
-                $p = $nData['prev'];
-                if ($p == $this->head->get()) {
-                    $r = $this->tryAcquireShared($thread, $arg);
-                    if ($r >= 0) {
-                        $this->setHeadAndPropagate($pid, $r);
-                        $pData = $this->queue->get((string) $p);
-                        $pData['next'] = -1;
-                        $this->queue->set((string) $p, $pData);
-
-                        if ($interrupted) {
-                            self::selfInterrupt($thread);
-                        }
-                        $failed = false;
-                        return;
-                    }
-                }
-                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
-                    $interrupted = true;
-                }
-            }
-        } finally {
-            if ($failed) {
-                $this->cancelAcquire($pid);
-            }
-        }
-    }
-
-    /**
-     * Acquires in shared interruptible mode.
-     * @param arg the acquire argument
-     */
-    private function doAcquireSharedInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
-    {
-        $this->addWaiter($thread, 2);
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            for (;;) {
-                $nData = $this->queue->get((string) $pid);  
-                $p = $nData['prev'];
-                if ($p == $this->head->get()) {
-                    $r = $this->tryAcquireShared($thread, $arg);
-                    if ($r >= 0) {
-                        $this->setHeadAndPropagate($pid, $r);
-                        $pData = $this->queue->get((string) $p);
-                        $pData['next'] = -1;
-                        $this->queue->set((string) $p, $pData);
-
-                        $failed = false;
-                        return;
-                    }
-                }
-                if ($this->shouldParkAfterFailedAcquire($p, $pid) && $this->parkAndCheckInterrupt($thread)) {
-                    throw new \Exception("Interrupted");
-                }
-            }
-        } finally {
-            if ($failed) {
-                $this->cancelAcquire($pid);
-            }
-        }
-    }
-
-    /**
-     * Acquires in shared timed mode.
-     *
-     * @param arg the acquire argument
-     * @param nanosTimeout max wait time
-     * @return {@code true} if acquired
-     */
-    private function doAcquireSharedNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
-    {
-        if ($nanosTimeout <= 0) {
-            return false;
-        }
-        $deadline = round(microtime(true)) * 1000 + $nanosTimeout;
-        $this->addWaiter($thread, 2);
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            for (;;) {
-                $nData = $this->queue->get((string) $pid);  
-                $p = $nData['prev'];
-                if ($p == $this->head->get()) {
-                    $r = $this->tryAcquireShared($thread, $arg);
-                    if ($r >= 0) {
-                        $this->setHeadAndPropagate($pid, $r);
-                        $pData = $this->queue->get((string) $p);
-                        $pData['next'] = -1;
-                        $this->queue->set((string) $p, $pData);
-
-                        $failed = false;
-                        return true;
-                    }
-                }
-                $nanosTimeout = $deadline - round(microtime(true)) * 1000;
-                if ($nanosTimeout <= 0) {
-                    return false;
-                }
-                if ($this->shouldParkAfterFailedAcquire($p, $pid) &&
-                    $nanosTimeout > self::$spinForTimeoutThreshold) {
-                    LockSupport::parkNanos($thread, $this, $nanosTimeout);
-                }
-                if ($thrfead->isInterrupted()) {
-                    throw new \Exception("Interrupted");
-                }
-            }
-        } finally {
-            if ($failed) {
-                $this->cancelAcquire($pid);
-            }
-        }
+        return 0;
     }
 
     // Main exported methods
@@ -836,28 +752,6 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     }
 
     /**
-     * Acquires in exclusive mode, ignoring interrupts.  Implemented
-     * by invoking at least once {@link #tryAcquire},
-     * returning on success.  Otherwise the thread is queued, possibly
-     * repeatedly blocking and unblocking, invoking {@link
-     * #tryAcquire} until success.  This method can be used
-     * to implement method {@link Lock#lock}.
-     *
-     * @param arg the acquire argument.  This value is conveyed to
-     *        {@link #tryAcquire} but is otherwise uninterpreted and
-     *        can represent anything you like.
-     */
-    public function acquire(?ThreadInterface $thread = null, int $arg = 0)
-    {
-        if (!$this->tryAcquire($thread, $arg)) {
-            $node = $this->addWaiter($thread, 1);
-            if ($this->acquireQueued($thread, $node, $arg)) {
-                self::selfInterrupt($thread);
-            }
-        }
-    }
-
-    /**
      * Acquires in exclusive mode, aborting if interrupted.
      * Implemented by first checking interrupt status, then invoking
      * at least once {@link #tryAcquire}, returning on
@@ -871,12 +765,12 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        can represent anything you like.
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function acquireInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
+    public function acquireInterruptibly(?ThreadInterface $thread, int $arg): void
     {
-        if ($thread->isInterrupted())
+        $node = null;
+        if (($thread !== null && $thread->isInterrupted()) ||
+            (!$this->tryAcquire($thread, $arg) && $this->acquire($thread, $node, $arg, false, true, false, 0) < 0)) {
             throw new \Exception("Interrupted");
-        if (!$this->tryAcquire($thread, $arg)) {
-            $this->doAcquireInterruptibly($thread, $arg);
         }
     }
 
@@ -897,13 +791,25 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @return {@code true} if acquired; {@code false} if timed out
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function tryAcquireNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
+    public function tryAcquireNanos(?ThreadInterface $thread, int $arg, int $nanosTimeout): bool
     {
-        if ($thread->isInterrupted()) {
-            throw new \Exception("Interrupted");
+        if ($thread !== null && !$thread->isInterrupted()) {
+            if ($this->tryAcquire($thread, $arg)) {
+                return true;
+            }
+            if ($nanosTimeout <= 0) {
+                return false;
+            }
+            $node = null;
+            $stat = $this->acquire($thread, $node, $arg, false, true, true, hrtime(true) + $nanosTimeout);
+            if ($stat > 0) {
+                return true;
+            }
+            if ($stat === 0) {
+                return false;
+            }
         }
-        return $this->tryAcquire($thread, $arg) ||
-            $this->doAcquireNanos($thread, $arg, $nanosTimeout);
+        throw new \Exception("Interrupted");
     }
 
     /**
@@ -916,17 +822,51 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        can represent anything you like.
      * @return the value returned from {@link #tryRelease}
      */
-    public function release(?ThreadInterface $thread = null, int $arg = 0): bool
+    public function release(?ThreadInterface $thread, int $arg): bool
     {
         if ($this->tryRelease($thread, $arg)) {
-            $h = $this->head;
-            $hData = $h->get() !== -1 ? $this->queue->get((string) $h->get()) : false;
-            if ($hData !== false && $hData['waitStatus'] !== 0) {
-                $this->unparkSuccessor($h->get());                
-            }
+            $this->signalNext($this->head->get());
+            $this->cleanUp($thread);
             return true;
         }
         return false;
+    }
+
+    //prevent unlinked nodes to pile up in synchronization queue
+    private function cleanUp(?ThreadInterface $thread = null): void
+    {        
+        $release = self::$releaseCounter->get();
+        $threshold = $release - self::CLEAN_UP_BATCH_SIZE;
+
+        $pid = $thread !== null ? $thread->pid : getmypid();
+        $i = 0;
+        foreach ($this->conditions as $condition) {
+            $tail = $condition->firstWaiter->get();
+            $nodes = [];
+            while ($tail !== -1) {
+                $tNode = $condition->queue->get((string) $tail);
+                $nodes[] = $tail;
+                $tail = $tNode['nextWaiter'];                    
+            }
+
+            foreach ($condition->queue as $key => $node) {
+                if (!in_array($node['id'], $nodes) && $node['release'] <= $threshold && $node['status'] !== 1) {    
+                    $condition->queue->del((string) $key);
+                }
+            }
+        }
+
+        $this->queue->rewind();
+        while ($this->queue->valid()) {
+            $node = $this->queue->current();            
+            if ($node['release'] < $threshold && $node['next'] === -1 && $node['prev'] === -1 && $node['status'] === 0 && ($node['waiter'] === $pid || $node['waiter'] === -1) && $this->head->get() !== $node['id']) {
+                $key = $this->queue->key();
+                $this->queue->del($key);
+            }
+            $this->queue->next();
+        }
+        
+        self::$releaseCounter->add();       
     }
 
     /**
@@ -940,10 +880,11 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        {@link #tryAcquireShared} but is otherwise uninterpreted
      *        and can represent anything you like.
      */
-    public function acquireShared(?ThreadInterface $thread = null, int $arg = 0): void
+    public function acquireShared(?ThreadInterface $thread, int $arg): void
     {
         if ($this->tryAcquireShared($thread, $arg) < 0) {
-            $this->doAcquireShared($thread, $arg);
+            $node = null;
+            $this->acquire($thread, $node, $arg, true, false, false, 0);
         }
     }
 
@@ -960,13 +901,13 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * you like.
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function acquireSharedInterruptibly(?ThreadInterface $thread = null, int $arg = 0): void
+    public function acquireSharedInterruptibly(?ThreadInterface $thread, int $arg): void
     {
-        if ($thread !== null && $thread->isInterrupted()) {
+        $node = null;
+        if (($thread !== null && $thread->isInterrupted()) ||
+            ($this->tryAcquireShared($thread, $arg) < 0 &&
+             $this->acquire($thread, $node, $arg, true, true, false, 0) < 0)) {
             throw new \Exception("Interrupted");
-        }
-        if ($this->tryAcquireShared($thread, $arg) < 0) {
-            $this->doAcquireSharedInterruptibly($thread, $arg);
         }
     }
 
@@ -986,13 +927,26 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * @return {@code true} if acquired; {@code false} if timed out
      * @throws InterruptedException if the current thread is interrupted
      */
-    public function tryAcquireSharedNanos(?ThreadInterface $thread = null, int $arg = 0, int $nanosTimeout = 0): bool
+    public function tryAcquireSharedNanos(?ThreadInterface $thread, int $arg, int $nanosTimeout): bool
     {
-        if ($thread->isInterrupted()) {
-            throw new \Exception("Interrupted");
+        if (!($thread !== null && $thread->isInterrupted()) || $thread === null) {
+            if ($this->tryAcquireShared($thread, $arg) >= 0) {
+                return true;
+            }
+            if ($nanosTimeout <= 0) {
+                return false;
+            }
+            $node = null;
+            $stat = $this->acquire($thread, $node, $arg, true, true, true,
+                               hrtime(true) + $nanosTimeout);
+            if ($stat > 0) {
+                return true;
+            }
+            if ($stat === 0) {
+                return false;
+            }
         }
-        return $this->tryAcquireShared($thread, $arg) >= 0 ||
-            $this->doAcquireSharedNanos($thread, $arg, $nanosTimeout);
+        throw new \Exception("Interrupted");
     }
 
     /**
@@ -1004,10 +958,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *        and can represent anything you like.
      * @return the value returned from {@link #tryReleaseShared}
      */
-    public function releaseShared(?ThreadInterface $thread = null, int $arg = 0): bool
+    public function releaseShared(?ThreadInterface $thread, int $arg): bool
     {
         if ($this->tryReleaseShared($thread, $arg)) {
-            $this->doReleaseShared();
+            $this->signalNext($this->head->get());
             return true;
         }
         return false;
@@ -1015,25 +969,30 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
 
     // Queue inspection methods
 
+    private static $testCounter;
     /**
      * Queries whether any threads are waiting to acquire. Note that
      * because cancellations due to interrupts and timeouts may occur
      * at any time, a {@code true} return does not guarantee that any
      * other thread will ever acquire.
      *
-     * <p>In this implementation, this operation returns in
-     * constant time.
-     *
      * @return {@code true} if there may be other threads waiting to acquire
      */
     public function hasQueuedThreads(): bool
     {
-        return $this->head->get() != $this->tail->get();
+        for ($p = $this->tail->get(), $h = $this->head->get(); $p !== $h && $p !== -1; ) {
+            $pData = $this->queue->get((string) $p);
+            if ($pData['status'] >= 0) {
+                return true;
+            }
+            $p = $pData['prev'];
+        }
+        return false;
     }
 
     /**
      * Queries whether any threads have ever contended to acquire this
-     * synchronizer; that is if an acquire method has ever blocked.
+     * synchronizer; that is, if an acquire method has ever blocked.
      *
      * <p>In this implementation, this operation returns in
      * constant time.
@@ -1042,7 +1001,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     public function hasContended(): bool
     {
-        return $this->head->get() != -1;
+        return $this->head->get() !== -1;
     }
 
     /**
@@ -1058,47 +1017,18 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     public function getFirstQueuedThread(): ?int
     {
-        // handle only fast path, else relay
-        return ($this->head->get() == $this->tail->get()) ? null : $this->fullGetFirstQueuedThread();
-    }
-
-    /**
-     * Version of getFirstQueuedThread called when fastpath fails
-     */
-    private function fullGetFirstQueuedThread(): ?ThreadInterface
-    {
-        /*
-         * The first node is normally head.next. Try to get its
-         * thread field, ensuring consistent reads: If thread
-         * field is nulled out or s.prev is no longer head, then
-         * some other thread(s) concurrently performed setHead in
-         * between some of our reads. We try this twice before
-         * resorting to traversal.
-         */
-        if ((($h = $this->head)->get() !== -1 && ($hData = $this->queue->get((string) $h->get())) !== false && $hData['next'] !== 0 && ($nData = $this->queue->get((string) $hData['next'])) !== false && $nData['prev'] == $this->head->get() && $nData['thread'] !== 0) || (($h = $this->head)->get() !== -1 && ($hData = $this->queue->get((string) $h->get())) !== false && $hData['next'] !== 0 && ($nData = $this->queue->get((string) $hData['next'])) !== false && $nData['prev'] == $this->head->get() && $nData['pid'] !== 0)) {
-            return $nData['pid'];
-        }
-
-        /*
-         * Head's next field might not have been set yet, or may have
-         * been unset after setHead. So we must check to see if tail
-         * is actually first node. If not, we continue on, safely
-         * traversing from tail back to head to find first,
-         * guaranteeing termination.
-         */
-        if ($this->tail->get() !== -1) {
-            $t = $this->tail->get();
-            $firstThread = null;
-            while ($t !== -1 && $t != $this->head->get()) {
-                $tData = $this->queue->get((string) $t);
-                $tt = $tData['pid'];
-                if ($tt !== 0) {
-                    $firstThread = $tt;
+        $first = null;
+        if (($h = $this->head->get()) !== -1 && (($hData = $this->queue->get((string) $h)) !== false && ($s = $hData['next']) === -1 ||
+                                   (($sData = $this->queue->get((string) $s)) !== false && (($first = $sData['waiter']) === -1) ||
+                                   $sData['prev'] === -1))) {
+            // traverse from tail on stale reads
+            for ($p = $this->tail->get(); $p !== -1 && ($pData = $this->queue->get((string) $p)) !== false && ($q = $pData['prev']) !== -1; $p = $q) {
+                if (($w = $pData['waiter']) !== -1) {
+                    $first = $w;
                 }
-                $t = $tData['prev'];
-            }
+            }                
         }
-        return $firstThread;
+        return $first;
     }
 
     /**
@@ -1117,7 +1047,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         if ($this->tail->get() !== -1) {
             for ($p = $this->tail->get(); $p !== 0; ) {
                 $pData = $this->queue->get((string) $p);
-                if ($pData['pid'] == $pid) {
+                if ($pData['waiter'] === $pid) {
                     return true;
                 }
                 $p = $pData['prev'];
@@ -1135,15 +1065,10 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * is not the first queued thread.  Used only as a heuristic in
      * ReentrantReadWriteLock.
      */
-    /*public function apparentlyFirstQueuedIsExclusive(): bool
+    public function apparentlyFirstQueuedIsExclusive(): bool
     {
-        $h = null;
-        $s = null;
-        return ($h = $this->head) != null &&
-            ($s = $h->next)  != null &&
-            !$s->isShared()         &&
-            $s->thread != null;
-    }*/
+        return ($h = $this->head->get()) !== -1 && ($hData = $this->queue->get((string) $h)) !== false && ($s = $hData['next']) !== -1 && ($sData = $this->queue->get((string) $s)) !== false && $sData['mode'] !== 1 && $sData['waiter'] !== -1;
+    }
 
     /**
      * Queries whether any threads have been waiting to acquire longer
@@ -1151,9 +1076,9 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *
      * <p>An invocation of this method is equivalent to (but may be
      * more efficient than):
-     *  <pre> {@code
-     * getFirstQueuedThread() != Thread.currentThread() &&
-     * hasQueuedThreads()}</pre>
+     * <pre> {@code
+     * getFirstQueuedThread() != Thread.currentThread()
+     *   && hasQueuedThreads()}</pre>
      *
      * <p>Note that because cancellations due to interrupts and
      * timeouts may occur at any time, a {@code true} return does not
@@ -1163,7 +1088,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * due to the queue being empty.
      *
      * <p>This method is designed to be used by a fair synchronizer to
-     * avoid <a href="AbstractQueuedSynchronizer#barging">barging</a>.
+     * avoid <a href="AbstractQueuedSynchronizer.html#barging">barging</a>.
      * Such a synchronizer's {@link #tryAcquire} method should return
      * {@code false}, and its {@link #tryAcquireShared} method should
      * return a negative value, if this method returns {@code true}
@@ -1171,7 +1096,7 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * tryAcquire} method for a fair, reentrant, exclusive mode
      * synchronizer might look like this:
      *
-     *  <pre> {@code
+     * <pre> {@code
      * protected boolean tryAcquire(int arg) {
      *   if (isHeldExclusively()) {
      *     // A reentrant acquire; increment hold count
@@ -1188,25 +1113,17 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      *         is at the head of the queue or the queue is empty
      * @since 1.7
      */
-    public function hasQueuedPredecessors(?ThreadInterface $thread = null): bool
+    public function hasQueuedPredecessors(): bool
     {
-        // The correctness of this depends on head being initialized
-        // before tail and on head.next being accurate if the current
-        // thread is first in queue.
-        $t = $this->tail; // Read fields in reverse initialization order
-        $h = $this->head;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        return $h->get() != $t->get() &&
-              (($hData = $this->queue->get((string) $h->get())) !== false) && 
-               (
-                    ($s = $hData['next']) === 0 || 
-                    ( 
-                        (($sData = $this->queue->get((string) $s)) !== false) &&
-                        $sData['pid'] !== $pid
-                    )
-                );
+        $first = null;
+        if (($h = $this->head->get()) !== -1 && ($hData = $this->queue->get((string) $h)) !== false && (($s = $hData['next']) === -1 ||
+                                   ( ($sData = $this->queue->get((string) $s)) !== false && (($first = $sData['waiter']) === -1 || $sData['prev'] === -1))
+                                   )) {
+            $firstBefore = $first;
+            $first = $this->getFirstQueuedThread(); // retry via getFirstQueuedThread
+        }        
+        return $first !== null && $first !== -1 && $first !== getmypid();
     }
-
 
     // Instrumentation and monitoring methods
 
@@ -1215,22 +1132,19 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * acquire.  The value is only an estimate because the number of
      * threads may change dynamically while this method traverses
      * internal data structures.  This method is designed for use in
-     * monitoring system state, not for synchronization
-     * control.
+     * monitoring system state, not for synchronization control.
      *
      * @return the estimated number of threads waiting to acquire
      */
     public function getQueueLength(): int
     {
         $n = 0;
-        if ($this->tail->get !== -1) {
-            for ($p = $this->tail->get(); $p !== 0;) {
-                $pData = $this->queue->get((string) $p);
-                if ($pData['pid'] !== 0) {
-                    $n += 1;
-                }
-                $p = $pData['prev'];
+        for ($p = $this->tail->get(); $p !== -1; ) {
+            $pData = $this->queue->get((string) $p);            
+            if ($pData['waiter'] !== -1) {
+                $n += 1;
             }
+            $p = $pData['prev'];
         }
         return $n;
     }
@@ -1249,14 +1163,13 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     public function getQueuedThreads(): array
     {
         $list = [];
-        if ($this->tail->get !== -1) {
-            for ($p = $this->tail->get(); $p !== 0;) {
-                $pData = $this->queue->get((string) $p);
-                if ($pData['pid'] !== 0) {
-                    $list[] = $pData['pid'];
-                }
-                $p = $pData['prev'];
+        for ($p = $this->tail->get(); $p !== -1;) {
+            $pData = $this->queue->get((string) $p); 
+            $t = $pData['waiter'];
+            if ($t !== -1 && $t !== 0) {
+                $list[] = $t;
             }
+            $p = $pData['prev'];
         }
         return $list;
     }
@@ -1272,15 +1185,15 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     public function getExclusiveQueuedThreads(): array
     {
         $list = [];
-        if ($this->tail->get() !== -1) {
-            for ($p = $this->tail->get(); $p !== 0;) {
-                $pData = $this->queue->get((string) $p);
-                $nData = $this->queue->get((string) $pData['nextWaiter']);
-                if ($pData['pid'] !== 0 && !($nData !== false && $nData['pid'] == 0 && $nData['waitStatus'] == 0 && $nData['nextWaiter'] == 0)) {
-                    $list[] = $pData['pid'];
+        for ($p = $this->tail->get(); $p !== -1;) {
+            $pData = $this->queue->get((string) $p); 
+            if ($pData['mode'] !== 1) {
+                $t = $pData['waiter'];
+                if ($t !== -1 && $t !== 0) {
+                    $list[] = $t;
                 }
-                $p = $pData['prev'];
             }
+            $p = $pData['prev'];
         }
         return $list;
     }
@@ -1296,15 +1209,15 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
     public function getSharedQueuedThreads(): array
     {
         $list = [];
-        if ($this->tail->get() !== -1) {
-            for ($p = $this->tail->get(); $p !== 0;) {
-                $pData = $this->queue->get((string) $p);
-                $nData = $this->queue->get((string) $pData['nextWaiter']);
-                if ($pData['pid'] !== 0 && $nData !== false && $nData['pid'] == 0 && $nData['waitStatus'] == 0  && $nData['nextWaiter'] == 0) {
-                    $list[] = $pData['pid'];
+        for ($p = $this->tail->get(); $p !== -1;) {
+            $pData = $this->queue->get((string) $p); 
+            if ($pData['mode'] === 1) {
+                $t = $pData['waiter'];
+                if ($t !== -1 && $t !== 0) {
+                    $list[] = $t;
                 }
-                $p = $pData['prev'];
             }
+            $p = $pData['prev'];
         }
         return $list;
     }
@@ -1320,150 +1233,9 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      */
     public function __toString(): string
     {
-        $s = $this->getState();
-        $q  = $this->hasQueuedThreads() ? "non" : "";
-        return /*parent::__toString() .*/ "[State = " . $s . ", " . $q . "empty queue]";
+        return "[State = " . $this->getState() . ", "
+            . ($this->hasQueuedThreads() ? "non" : "") . "empty queue]";
     }
-
-
-    // Internal support methods for Conditions
-
-    /**
-     * Returns true if a node, always one that was initially placed on
-     * a condition queue, is now waiting to reacquire on sync queue.
-     * @param thread the thread
-     * @return true if is reacquiring
-     */
-    public function isOnSyncQueue(int $node): bool
-    {
-        //When Node() is predicessor, then $nData['prev'] === 0, but it is not null
-        $nData = $this->queue->get((string) $node);
-        if ($nData === false || $nData['waitStatus'] == Node::CONDITION || $nData['prev'] === -1) {
-            return false;
-        }
-        if ($nData['next'] !== -1) {// If has successor, it must be on queue
-            return true;
-        }
-        /*
-         * node.prev can be non-null, but not yet on queue because
-         * the CAS to place it on queue can fail. So we have to
-         * traverse from tail to make sure it actually made it.  It
-         * will always be near the tail in calls to this method, and
-         * unless the CAS failed (which is unlikely), it will be
-         * there, so we hardly ever traverse much.
-         */
-        return $this->findNodeFromTail($nData);
-    }
-
-    /**
-     * Returns true if node is on sync queue by searching backwards from tail.
-     * Called only when needed by isOnSyncQueue.
-     * @return true if present
-     */
-    private function findNodeFromTail(array $node): bool
-    {
-        if ($this->tail->get() !== -1) {
-            $t = $this->tail->get();
-            for (;;) {
-                if ($t === $node['pid']) {
-                    return true;
-                }
-                if ($t === -1) {
-                    return false;
-                }
-                $tData = $this->queue->get((string) $t);
-                $t = $tData['prev'];
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Transfers a node from a condition queue onto sync queue.
-     * Returns true if successful.
-     * @param node the node
-     * @return true if successfully transferred (else the node was
-     * cancelled before signal)
-     */
-    public function transferForSignal(array $node): bool
-    {
-        /*
-         * If cannot change waitStatus, the node has been cancelled.
-         */
-        if (!$this->compareAndSetWaitStatus($node, Node::CONDITION, 0)) {
-            return false;
-        }
-
-        /*
-         * Splice onto queue and try to set waitStatus of predecessor to
-         * indicate that thread is (probably) waiting. If cancelled or
-         * attempt to set waitStatus fails, wake up to resync (in which
-         * case the waitStatus can be transiently and harmlessly wrong).
-         */        
-        $p = $this->enq($node);
-        $pData = $this->queue->get((string) $p);
-        if ($pData !== false) {
-            $ws = $pData['waitStatus'];
-            if (($ws !== false && $ws > 0) || !$this->compareAndSetWaitStatus($pData, $ws, Node::SIGNAL)) {
-                LockSupport::unpark($node['pid']);
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Transfers node, if necessary, to sync queue after a cancelled wait.
-     * Returns true if thread was cancelled before being signalled.
-     *
-     * @param node the node
-     * @return true if cancelled before the node was signalled
-     */
-    public function transferAfterCancelledWait(array $node): bool
-    {
-        if ($this->compareAndSetWaitStatus($node, Node::CONDITION, 0)) {
-            $this->enq($node);
-            return true;
-        }
-        /*
-         * If we lost out to a signal(), then we can't proceed
-         * until it finishes its enq().  Cancelling during an
-         * incomplete transfer is both rare and transient, so just
-         * spin.
-         */
-        while (!$this->isOnSyncQueue($node['pid'])) {
-            //Thread.yield();
-            usleep(1);
-        }
-        return false;
-    }
-
-    /**
-     * Invokes release with current state value; returns saved state.
-     * Cancels node and throws exception on failure.
-     * @param thread to be released
-     * @return previous sync state
-     */
-    public function fullyRelease(?ThreadInterface $thread = null): int
-    {
-        $failed = true;
-        $pid = $thread !== null ? $thread->getPid() : getmypid();
-        try {
-            $savedState = $this->getState();
-            if ($this->release($thread, $savedState)) {
-                $failed = false;
-                return $savedState;
-            } else {
-                throw new \Exception("Illegal monitor state");
-            }
-        } finally {
-            if ($failed) {
-                $nodeData = $this->queue->get((string) $pid);
-                $nodeData['waitStatus'] = Node::CANCELLED;
-            }
-        }
-    }
-
-    // Instrumentation methods for conditions
 
     /**
      * Queries whether the given ConditionObject
@@ -1507,8 +1279,8 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
      * given condition associated with this synchronizer. Note that
      * because timeouts and interrupts may occur at any time, the
      * estimate serves only as an upper bound on the actual number of
-     * waiters.  This method is designed for use in monitoring of the
-     * system state, not for synchronization control.
+     * waiters.  This method is designed for use in monitoring system
+     * state, not for synchronization control.
      *
      * @param condition the condition
      * @return the estimated number of waiting threads
@@ -1549,47 +1321,9 @@ abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer
         }
         return $condition->getWaitingThreads();
     }
-
-    private function initHead(): bool
+    
+    public function getQueue(): \Swoole\Table
     {
-        if ($this->head->get() === -1) {
-            $this->head->set(0);
-            return true;
-        }
-        return false;
-    }
-
-    private function compareAndSetTail(int $expect, int $update): bool
-    {
-        if ($this->tail->get() == $expect) {
-            $this->tail->set($update);
-            return true;
-        }
-        return false;
-    }
-
-    private function compareAndSetWaitStatus(array &$node, int $expect, int $update): bool
-    {
-        if ($node['waitStatus'] == $expect) {
-            $node['waitStatus'] = $update;
-            $this->queue->set((string) $node['pid'], $node);
-            return true;
-        }
-        return false;
-    }
-
-    private function compareAndSetNext(int $node, int $expect, ?int $update): bool
-    {
-        $nodeData = $this->queue->get((string) $node);        
-        if ($nodeData !== false && $nodeData['next'] == $expect) {
-            if ($update == null) {
-                $nodeData['next'] = 0;   
-            } else {
-                $nodeData['next'] = $update;                
-            }
-            $this->queue->set((string) $node, $nodeData);
-            return true;
-        }
-        return false;
+        return $this->queue;
     }
 }

@@ -6,21 +6,33 @@ use Concurrent\ThreadInterface;
 
 class NonfairSync extends ReentrantLockSync
 {
-    /**
-     * Performs lock.  Try immediate barge, backing up to normal
-     * acquire on failure.
-     */
-    public function lock(?ThreadInterface $thread = null): void
+    public function initialTryLock(?ThreadInterface $thread = null): bool
     {
-        if ($this->compareAndSetState(0, 1)) {
-            $this->setExclusiveOwnerThread($thread);
+        $current = getmypid();
+        if ($this->compareAndSetState(0, 1)) { // first attempt is unguarded
+            $this->setExclusiveOwnerThread($current);
+            return true;
+        } elseif ($this->getExclusiveOwnerThread() === $current) {
+            $c = $this->getState() + 1;
+            if ($c < 0) {// overflow
+                throw new Error("Maximum lock count exceeded");
+            }
+            $this->setState($c);
+            return true;
         } else {
-            $this->acquire($thread, 1);
+            return false;
         }
     }
 
-    public function acquire(?ThreadInterface $thread = null, int $acquires = 0)
+    /**
+     * Acquire for non-reentrant cases after initialTryLock prescreen
+     */
+    public function tryAcquire(?ThreadInterface $thread = null, int $acquires = 0): bool
     {
-        return $this->nonfairTryAcquire($thread, $acquires);
+        if ($this->getState() === 0 && $this->compareAndSetState(0, $acquires)) {
+            $this->setExclusiveOwnerThread(getmypid());
+            return true;
+        }
+        return false;
     }
 }

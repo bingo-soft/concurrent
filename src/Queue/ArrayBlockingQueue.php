@@ -6,6 +6,7 @@ use Concurrent\{
     ThreadInterface,
     TimeUnit
 };
+use Concurrent\Lock\ReentrantLock;
 
 class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 {
@@ -82,7 +83,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function __construct(int $capacity = self::DEFAULT_CAPACITY, bool $fair = false, $c = null)
     {
-        $this->lock = new \Swoole\Lock(SWOOLE_MUTEX);
+        $this->lock = new ReentrantLock(true);//new \Swoole\Lock(SWOOLE_MUTEX);
         if ($capacity < 0) {
             throw new \Exception("Illegal capacity");
         }
@@ -92,7 +93,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
             $this->items[] = null;
         }
         $i = 0;
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             if (is_array($c)) {
                 foreach ($c as $e) {
@@ -113,7 +114,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     public function offer($e, ?ThreadInterface $thread = null): bool
     {
         self::checkNotNull($e);
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             if ($this->count === count($this->items)) {
                 return false;
@@ -126,10 +127,10 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         }
     }
 
-    public function poll(int $timeout, string $unit, ?ThreadInterface $thread = null)
+    public function poll(?int $timeout = null, ?string $unit = null, ?ThreadInterface $thread = null)
     {
         $nanos = TimeUnit::toNanos($timeout, $unit);
-        $this->lock->trylock();
+        $this->lock->lockInterruptibly();
         try {
             time_nanosleep(0, $nanos);
             return $thread->pop();
@@ -140,7 +141,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function take(?ThreadInterface $thread = null)
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             return $thread->pop();
         } finally {
@@ -150,7 +151,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function peek()
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             return ($this->count === 0) ? null : $this->itemAt($this->takeIndex);
         } finally {
@@ -165,7 +166,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function size(): int
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             return $this->count;
         } finally {
@@ -182,7 +183,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function remove($o = null)
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             if ($o === null) {
                 return false;
@@ -231,7 +232,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function contains($o): bool
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             if ($o === null) {
                 return false;
@@ -255,7 +256,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function toArray(array &$c = null): array
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             if ($c === null) {
                 $a = [];
@@ -280,7 +281,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function clear(): void
     {
-        $this->lock->trylock();
+        $this->lock->lock();
         try {
             for ($i = $this->takeIndex, $k = $this->count; $k > 0; $i = $this->inc($i), $k -= 1) {
                 $this->items[$i] = null;
@@ -293,7 +294,7 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         }
     }
 
-    public function drainTo(&$c, int $maxElements = null): int
+    public function drainTo(&$c, int $maxElements = \PHP_INT_MAX): int
     {
         self::checkNotNull($c);
         if ($c === $this) {

@@ -12,6 +12,8 @@ class ReentrantLock implements LockInterface
     /** Synchronizer providing all implementation mechanics */
     public $sync;
 
+    public $xid;
+
     /**
      * Creates an instance of {@code ReentrantLock} with the
      * given fairness policy.
@@ -20,6 +22,7 @@ class ReentrantLock implements LockInterface
      */
     public function __construct(bool $fair = false)
     {
+        $this->xid = md5(microtime() . rand());
         $this->sync = $fair ? new FairSync() : new NonfairSync();
     }
 
@@ -90,7 +93,8 @@ class ReentrantLock implements LockInterface
      */
     public function lockInterruptibly(?ThreadInterface $thread = null): void
     {
-        $this->sync->acquireInterruptibly($thread, 1);
+        $node = null;
+        $this->sync->acquireInterruptibly($thread, $node, 1);
     }
 
     /**
@@ -187,7 +191,9 @@ class ReentrantLock implements LockInterface
      */
     public function unlock(?ThreadInterface $thread = null): void
     {
+        //$this->sync->printQueue();
         $this->sync->release($thread, 1);
+        //$this->sync->printQueue();
     }
 
     /**
@@ -350,7 +356,7 @@ class ReentrantLock implements LockInterface
      *
      * @return the owner, or {@code null} if not owned
      */
-    public function getOwner(): ?ThreadInterface
+    public function getOwner(): ?int
     {
         return $this->sync->getOwner();
     }
@@ -490,6 +496,6 @@ class ReentrantLock implements LockInterface
     public function __toString(): string
     {
         $o = $this->sync->getOwner();
-        return (($o == null) ? "[Unlocked]" : "[Locked by thread " . $o->pid . "]");
+        return (($o === null || $o === -1) ? "[Unlocked]" : "[Locked by thread " . $o . "]");
     }
 }

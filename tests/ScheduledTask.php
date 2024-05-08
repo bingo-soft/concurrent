@@ -7,9 +7,9 @@ use Concurrent\{
     ThreadInterface
 };
 
-class TestTask implements RunnableInterface
+class ScheduledTask implements RunnableInterface
 {
-    private $name;
+    public $name;
 
     public function __construct(string $name)
     {
@@ -28,13 +28,14 @@ class TestTask implements RunnableInterface
         $this->name = $data['name'];
     }
 
-    public function getName(): string
+    public function getName()
     {
         return $this->name;
     }
 
     public function run(ThreadInterface $process = null, ...$args): void
     {
-        fwrite(STDERR, getmypid() . ": test task executed\n");
+        //Uncomment, if you want to see response from task executed
+        //fwrite(STDERR, getmypid() . ": ===============>>>>> task " . $this->name . " executed at " . hrtime(true) . "\n");
     }
 }
