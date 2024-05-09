@@ -339,7 +339,7 @@ class ForkJoinPool implements ExecutorServiceInterface
         $ex = null;
         $wt = null;
         try {            
-            if ($fac !== null && ($wt = $fac->newWorker($this)) !== null) {
+            if ($fac !== null && ($wt = $fac->newWorker(null, $this)) !== null) {
                 $wt->start();
                 return true;
             }
