@@ -7,7 +7,8 @@ use Concurrent\{
     RunnableFutureInterface,
     RunnableInterface,
     ThreadInterface,
-    TimeUnit
+    TimeUnit,
+    WorkerFactoryInterface
 };
 use Concurrent\Lock\{
     LockSupport,
@@ -338,7 +339,7 @@ class ForkJoinPool implements ExecutorServiceInterface
         $ex = null;
         $wt = null;
         try {            
-            if ($fac !== null && ($wt = $fac->newThread($this)) !== null) {
+            if ($fac !== null && ($wt = $fac->newWorker($this)) !== null) {
                 $wt->start();
                 return true;
             }
@@ -1427,7 +1428,7 @@ class ForkJoinPool implements ExecutorServiceInterface
     public function __construct(
         ?int $port = 1081,
         ?int $parallelism = null,
-        ?ForkJoinWorkerFactoryInterface $factory = null,
+        ?WorkerFactoryInterface $factory = null,
         $handler = null,
         ?int $mode = null,
         ?string $workerNamePrefix = null
@@ -1607,7 +1608,7 @@ class ForkJoinPool implements ExecutorServiceInterface
      *
      * @return the factory used for constructing new workers
      */
-    public function getFactory(): ForkJoinWorkerFactoryInterface
+    public function getFactory(): WorkerFactoryInterface
     {
         return $this->factory;
     }

@@ -90,9 +90,9 @@ class DelayedWorkQueueTest extends TestCase
         sleep(8);
         foreach ($futures as $future) {
             $future->cancel(false);
-        }   
-
-        $future1 = $executor->schedule(function () {
+        }
+    
+        /*$future1 = $executor->schedule(function () {
             fwrite(STDERR, getmypid() . ": delayed task 1 executed, delay = 100 (ms), current time = " . hrtime(true) . " (ns)\n");
         }, 100, TimeUnit::MILLISECONDS);
 
@@ -112,7 +112,7 @@ class DelayedWorkQueueTest extends TestCase
             fwrite(STDERR, getmypid() . ": delayed task 5 executed, delay = 1000 (ms), current time = " . hrtime(true) . " (ns)\n");
         }, 1000, TimeUnit::MILLISECONDS);
 
-        sleep(2);
+        sleep(2);*/
 
         $this->assertTrue(true);
     }

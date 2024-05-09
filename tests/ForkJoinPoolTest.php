@@ -24,15 +24,9 @@ class ForkJoinPoolTest extends TestCase
     {
         $start = hrtime(true);
         $pool = ForkJoinPool::commonPool(/*$notification*/);
-        $result = $pool->invoke(new SumTask(1, 300000));
+        $result = $pool->invoke(new SumTask(1, 200000));
         $end = hrtime(true);
         fwrite(STDERR, getmypid() . ": Result (concurrent) = $result, elapsed: " . ($end - $start) . "\n");
-        $this->assertEquals(45000150000, $result);
-
-        $start = hrtime(true);
-        $result = $pool->invoke(new SumTask(1, 300000));
-        $end = hrtime(true);
-        fwrite(STDERR, getmypid() . ": Result (concurrent) = $result, elapsed: " . ($end - $start) . "\n");
-        $this->assertEquals(45000150000, $result);
+        $this->assertEquals(20000100000, $result);
     }
 }

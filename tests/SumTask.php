@@ -51,7 +51,8 @@ class SumTask extends RecursiveTask
             $sum = 0;
             for ($i = $this->start; $i <= $this->end; $i++) {
                 $sum += $i;
-            }            
+            }
+            fwrite(STDERR, getmypid() . ": calculate sum: $sum\n");          
             return $sum;
         } else { // Recursive case
             $mid = $this->start + ($this->end - $this->start) / 2;

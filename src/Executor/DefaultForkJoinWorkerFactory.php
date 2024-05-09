@@ -2,12 +2,17 @@
 
 namespace Concurrent\Executor;
 
+use Concurrent\{
+    ExecutorServiceInterface,
+    ThreadInterface,
+    WorkerFactoryInterface
+};
 use Concurrent\Worker\ForkJoinWorker;
 
-class DefaultForkJoinWorkerFactory implements ForkJoinWorkerFactoryInterface
+class DefaultForkJoinWorkerFactory implements WorkerFactoryInterface
 {
-    public function newThread(ForkJoinPool $pool): ForkJoinWorker
+    public function newWorker(?ExecutorServiceInterface $executor = null): ThreadInterface
     {
-        return new ForkJoinWorker($pool);
+        return new ForkJoinWorker($executor);
     }
 }
