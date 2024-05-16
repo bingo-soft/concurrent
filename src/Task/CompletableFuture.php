@@ -18,7 +18,7 @@ use Concurrent\Executor\{
     ThreadLocalRandom
 };
 
-class CompletableFuture implements FutureInterface
+class CompletableFuture implements FutureInterface, CompletionStageInterface
 {
     //8KB per serialized task, should be enough
     public const DEFAULT_SIZE = 8192;
@@ -1073,82 +1073,82 @@ class CompletableFuture implements FutureInterface
         return $triggered;
     }
 
-    public function thenApply(callable $fn): CompletableFuture
+    public function thenApply(callable $fn): CompletionStageInterface
     {
         return $this->uniApplyStage(null, $fn);
     }
 
-    public function thenApplyAsync(callable $fn, ?ExecutorInterface $executor = null): CompletableFuture
+    public function thenApplyAsync(callable $fn, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->uniApplyStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $fn);
     }
 
-    public function thenRun(RunnableInterface | callable $action): CompletableFuture
+    public function thenRun(RunnableInterface | callable $action): CompletionStageInterface
     {
         return $this->uniRunStage(null, $action);
     }
 
-    public function thenRunAsync(RunnableInterface | callable $action, ?ExecutorInterface $executor = null): CompletableFuture
+    public function thenRunAsync(RunnableInterface | callable $action, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->uniRunStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $action);
     }
 
-    public function thenCombine($other, $fn): CompletableFuture
+    public function thenCombine(CompletionStageInterface $other, $fn): CompletionStageInterface
     {
         return $this->biApplyStage(null, $other, $fn);
     }
 
-    public function thenCombineAsync($other, $fn, ?ExecutorInterface $executor = null): CompletableFuture
+    public function thenCombineAsync(CompletionStageInterface $other, $fn, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->biApplyStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $other, $fn);
     }
 
-    public function runAfterBoth($other, RunnableInterface | callable $action): CompletableFuture
+    public function runAfterBoth(CompletionStageInterface $other, RunnableInterface | callable $action): CompletionStageInterface
     {
         return $this->biRunStage(null, $other, $action);
     }
 
-    public function runAfterBothAsync($other, RunnableInterface | callable $action, ?ExecutorInterface $executor = null): CompletableFuture
+    public function runAfterBothAsync(CompletionStageInterface $other, RunnableInterface | callable $action, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->biRunStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $other, $action);
     }
 
-    public function applyToEither($other, callable $fn): CompletableFuture
+    public function applyToEither(CompletionStageInterface $other, callable $fn): CompletionStageInterface
     {
         return $this->orApplyStage(null, $other, $fn);
     }
 
-    public function applyToEitherAsync($other, callable $fn, ?ExecutorInterface $executor = null): CompletableFuture
+    public function applyToEitherAsync(CompletionStageInterface $other, callable $fn, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->orApplyStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $other, $fn);
     }
 
-    public function runAfterEither($other, RunnableInterface | callable $action): CompletableFuture
+    public function runAfterEither(CompletionStageInterface $other, RunnableInterface | callable $action): CompletionStageInterface
     {
         return $this->orRunStage(null, $other, $action);
     }
 
-    public function runAfterEitherAsync($other, RunnableInterface | callable $action, ?ExecutorInterface $executor = null): CompletableFuture
+    public function runAfterEitherAsync(CompletionStageInterface $other, RunnableInterface | callable $action, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->orRunStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $other, $action);
     }
 
-    public function thenCompose(callable $fn): CompletableFuture
+    public function thenCompose(callable $fn): CompletionStageInterface
     {
         return $this->uniComposeStage(null, $fn);
     }
 
-    public function thenComposeAsync(callable $fn, ?ExecutorInterface $executor = null): CompletableFuture
+    public function thenComposeAsync(callable $fn, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->uniComposeStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $fn);
     }
 
-    public function whenComplete($action): CompletableFuture
+    public function whenComplete($action): CompletionStageInterface
     {
         return $this->uniWhenCompleteStage(null, $action);
     }
 
-    public function whenCompleteAsync($action, ?ExecutorInterface $executor = null): CompletableFuture
+    public function whenCompleteAsync($action, ?ExecutorInterface $executor = null): CompletionStageInterface
     {
         return $this->uniWhenCompleteStage($executor == null ? self::defaultExecutor() : self::screenExecutor($executor), $action);
     }
