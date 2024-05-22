@@ -36,4 +36,29 @@ class TimeUnit
             return $duration * 1000000000;
         }
     }
+
+    public static function toMillis(int $duration, string $units): int
+    {
+        if (strtolower($units) == self::DAYS) {
+            return $duration * 86400000;
+        }
+        if (strtolower($units) == self::HOURS) {
+            return $duration * 3600000;
+        }
+        if (strtolower($units) == self::MICROSECONDS) {
+            return floor($duration / 1000);
+        }
+        if (strtolower($units) == self::MILLISECONDS) {
+            return $duration;
+        }
+        if (strtolower($units) == self::MINUTES) {
+            return $duration * 60000;
+        }
+        if (strtolower($units) == self::NANOSECONDS) {
+            return floor($duration / 1000000);
+        }
+        if (strtolower($units) == self::SECONDS) {
+            return $duration * 1000;
+        }
+    }
 }
