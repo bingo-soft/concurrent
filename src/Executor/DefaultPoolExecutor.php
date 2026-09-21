@@ -611,7 +611,12 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
                 $r = $timed ?
                     $this->workQueue->poll($this->keepAliveTime, TimeUnit::NANOSECONDS, $thread) :
                     $this->workQueue->take($thread);
-                    
+
+                // Swoole queues return false when they are empty, interrupted,
+                // or already released. Treat that as the absence of a task.
+                if ($r === false) {
+                    $r = null;
+                }
                 if (is_object($r)) {
                     return $r;
                 }

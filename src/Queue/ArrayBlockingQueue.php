@@ -130,10 +130,10 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     public function poll(?int $timeout = null, ?string $unit = null, ?ThreadInterface $thread = null)
     {
         $nanos = TimeUnit::toNanos($timeout, $unit);
-        $this->lock->lockInterruptibly();
+        $this->lock->lockInterruptibly($thread);
         try {
             time_nanosleep(0, $nanos);
-            return $thread->pop();
+            return $this->normalizeQueueResult($thread->pop());
         } finally {
             $this->lock->unlock();
         }
@@ -143,10 +143,15 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     {
         $this->lock->lock();
         try {
-            return $thread->pop();
+            return $this->normalizeQueueResult($thread->pop());
         } finally {
             $this->lock->unlock();
         }
+    }
+
+    private function normalizeQueueResult($value)
+    {
+        return $value === false ? null : $value;
     }
 
     public function peek()

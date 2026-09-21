@@ -93,8 +93,7 @@ class ReentrantLock implements LockInterface
      */
     public function lockInterruptibly(?ThreadInterface $thread = null): void
     {
-        $node = null;
-        $this->sync->acquireInterruptibly($thread, $node, 1);
+        $this->sync->acquireInterruptibly($thread, 1);
     }
 
     /**

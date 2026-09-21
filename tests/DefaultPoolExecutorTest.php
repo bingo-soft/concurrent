@@ -5,6 +5,7 @@ namespace Tests;
 use PHPUnit\Framework\TestCase;
 use Concurrent\Executor\DefaultPoolExecutor;
 use Concurrent\Queue\ArrayBlockingQueue;
+use Concurrent\ThreadInterface;
 use Concurrent\TimeUnit;
 
 class DefaultPoolExecutorTest extends TestCase
@@ -52,6 +53,31 @@ class DefaultPoolExecutorTest extends TestCase
         usleep(100000);
         $pool->shutdown();
         $this->assertTrue($pool->isShutdown());
+    }
+
+    public function testTakeReturnsNullWhenProcessQueueIsClosed(): void
+    {
+        $queue = new ArrayBlockingQueue(1);
+        $thread = new QueueResultThread(false);
+
+        $this->assertNull($queue->take($thread));
+    }
+
+    public function testTakeReturnsNormalizedSerializedPayload(): void
+    {
+        $queue = new ArrayBlockingQueue(1);
+        $payload = serialize(new TestTask('queued task'));
+        $thread = new QueueResultThread($payload);
+
+        $this->assertSame($payload, $queue->take($thread));
+    }
+
+    public function testPollReturnsNullWhenProcessQueueIsEmptyOrInterrupted(): void
+    {
+        $queue = new ArrayBlockingQueue(1);
+        $thread = new QueueResultThread(false);
+
+        $this->assertNull($queue->poll(0, TimeUnit::NANOSECONDS, $thread));
     }
 
     public function testAbruptWorkerFailureStopsPoolWithoutReplacement(): void
@@ -108,5 +134,25 @@ class DefaultPoolExecutorTest extends TestCase
         }
 
         return count(file('/proc/sysvipc/msg'));
+    }
+}
+
+class QueueResultThread implements ThreadInterface
+{
+    private $result;
+
+    public function __construct($result)
+    {
+        $this->result = $result;
+    }
+
+    public function pop()
+    {
+        return $this->result;
+    }
+
+    public function isInterrupted(): bool
+    {
+        return false;
     }
 }
