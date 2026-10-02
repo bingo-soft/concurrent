@@ -28,6 +28,180 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public const DEFAULT_CAPACITY = 9999;
 
+    private const SHARED_TASK_BYTES = 8192;
+    private const WAIT_MICROSECONDS = 10000;
+    private const MAX_SHARED_TASKS = 16384;
+    private const SHARED_LOCK_TIMEOUT_SECONDS = 2.0;
+
+    private ?\Swoole\Table $sharedTasks = null;
+    private ?\Swoole\Atomic\Long $sharedCount = null;
+    private ?\Swoole\Atomic\Long $sharedHead = null;
+    private ?\Swoole\Atomic\Long $sharedTail = null;
+    private ?\Swoole\Atomic\Long $sharedNextTaskId = null;
+
+    public function enableProcessSharing(): void
+    {
+        if ($this->sharedTasks !== null) {
+            return;
+        }
+        if ($this->count !== 0 || $this->capacity < 1) {
+            throw new \LogicException('Process sharing requires an empty queue with positive capacity');
+        }
+        if ($this->capacity > self::MAX_SHARED_TASKS) {
+            throw new \LengthException('Shared worker queue capacity exceeds the supported limit');
+        }
+
+        $tableCapacity = 1;
+        while ($tableCapacity < $this->capacity) {
+            $tableCapacity *= 2;
+        }
+        $tasks = new \Swoole\Table($tableCapacity);
+        $tasks->column('task', \Swoole\Table::TYPE_STRING, self::SHARED_TASK_BYTES);
+        $tasks->column('id', \Swoole\Table::TYPE_INT);
+        if (!$tasks->create()) {
+            throw new \RuntimeException('Unable to create shared worker task queue');
+        }
+        $mutex = new \Swoole\Lock(SWOOLE_MUTEX);
+        $this->sharedTasks = $tasks;
+        $this->sharedCount = new \Swoole\Atomic\Long(0);
+        $this->sharedHead = new \Swoole\Atomic\Long(0);
+        $this->sharedTail = new \Swoole\Atomic\Long(0);
+        $this->sharedNextTaskId = new \Swoole\Atomic\Long(0);
+        // Shared queue operations must use an OS-level process mutex, not
+        // the AQS spin lock used by the in-process collection.
+        $this->lock = $mutex;
+    }
+
+    public function isProcessShared(): bool
+    {
+        return $this->sharedTasks !== null;
+    }
+
+    private function lockShared(): void
+    {
+        if (!$this->lock->lockwait(self::SHARED_LOCK_TIMEOUT_SECONDS)) {
+            throw new \RuntimeException('Shared worker queue mutex acquisition timed out');
+        }
+    }
+
+    public function offerWithId($task): ?int
+    {
+        self::checkNotNull($task);
+        if ($this->sharedTasks === null) {
+            throw new \LogicException('Task IDs require a process-shared queue');
+        }
+        $serialized = serialize($task);
+        if (strlen($serialized) >= self::SHARED_TASK_BYTES) {
+            throw new \LengthException('Serialized worker task exceeds shared queue slot size');
+        }
+        $this->lockShared();
+        try {
+            if ($this->sharedCount->get() >= $this->capacity) {
+                return null;
+            }
+            $tail = $this->sharedTail->get();
+            $id = $this->sharedNextTaskId->add(1);
+            if (!$this->sharedTasks->set((string) $tail, ['task' => $serialized, 'id' => $id])) {
+                throw new \RuntimeException('Unable to enqueue worker task');
+            }
+            $this->sharedTail->set(($tail + 1) % $this->capacity);
+            $this->sharedCount->add(1);
+            return $id;
+        } finally {
+            $this->lock->unlock();
+        }
+    }
+
+    public function removeById(int $id): bool
+    {
+        if ($this->sharedTasks === null) {
+            throw new \LogicException('Task IDs require a process-shared queue');
+        }
+        $this->lockShared();
+        try {
+            $values = $this->sharedValues();
+            $position = $this->sharedHead->get();
+            for ($i = 0; $i < count($values); ++$i) {
+                if ($this->sharedTasks->get((string) $position, 'id') === $id) {
+                    $this->removeSharedAt($values, $i);
+                    return true;
+                }
+                $position = ($position + 1) % $this->capacity;
+            }
+            return false;
+        } finally {
+            $this->lock->unlock();
+        }
+    }
+
+    private function removeSharedAt(array $values, int $index): void
+    {
+        $position = $this->sharedHead->get();
+        $entries = [];
+        for ($i = 0; $i < count($values); ++$i) {
+            $entries[] = $this->sharedTasks->get((string) $position);
+            $position = ($position + 1) % $this->capacity;
+        }
+        $remaining = array_values(array_merge(array_slice($entries, 0, $index), array_slice($entries, $index + 1)));
+        $position = $this->sharedHead->get();
+        foreach ($remaining as $entry) {
+            $this->sharedTasks->set((string) $position, $entry);
+            $position = ($position + 1) % $this->capacity;
+        }
+        $this->sharedTasks->del((string) $position);
+        $this->sharedTail->set($position);
+        $this->sharedCount->sub(1);
+    }
+
+    private function sharedRemove(): ?string
+    {
+        if ($this->sharedCount->get() === 0) {
+            return null;
+        }
+        $head = $this->sharedHead->get();
+        $task = $this->sharedTasks->get((string) $head, 'task');
+        if ($task === false) {
+            throw new \RuntimeException('Shared worker queue lost an accepted task');
+        }
+        $this->sharedTasks->del((string) $head);
+        $this->sharedHead->set(($head + 1) % $this->capacity);
+        $this->sharedCount->sub(1);
+        return $task;
+    }
+
+    private function waitForSharedTask(?ThreadInterface $thread, ?int $deadline = null): ?string
+    {
+        for (;;) {
+            $this->lockShared();
+            try {
+                $task = $this->sharedRemove();
+            } finally {
+                $this->lock->unlock();
+            }
+            if ($task !== null || $thread?->isInterrupted() || ($deadline !== null && hrtime(true) >= $deadline)) {
+                return $task;
+            }
+            $remaining = $deadline === null ? self::WAIT_MICROSECONDS
+                : min(self::WAIT_MICROSECONDS, max(1, intdiv($deadline - hrtime(true), 1000)));
+            usleep($remaining);
+        }
+    }
+
+    private function sharedValues(): array
+    {
+        $values = [];
+        $position = $this->sharedHead->get();
+        for ($i = 0, $count = $this->sharedCount->get(); $i < $count; ++$i) {
+            $value = $this->sharedTasks->get((string) $position, 'task');
+            if ($value === false) {
+                throw new \RuntimeException('Shared worker queue lost an accepted task');
+            }
+            $values[] = $value;
+            $position = ($position + 1) % $this->capacity;
+        }
+        return $values;
+    }
+
     /**
      * Circularly increment i.
      */
@@ -114,6 +288,9 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
     public function offer($e, ?ThreadInterface $thread = null): bool
     {
         self::checkNotNull($e);
+        if ($this->sharedTasks !== null) {
+            return $this->offerWithId($e) !== null;
+        }
         $this->lock->lock();
         try {
             if ($this->count === count($this->items)) {
@@ -129,6 +306,10 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function poll(?int $timeout = null, ?string $unit = null, ?ThreadInterface $thread = null)
     {
+        if ($this->sharedTasks !== null) {
+            $nanos = $timeout === null ? 0 : TimeUnit::toNanos($timeout, $unit);
+            return $this->waitForSharedTask($thread, hrtime(true) + $nanos);
+        }
         $nanos = TimeUnit::toNanos($timeout, $unit);
         $this->lock->lockInterruptibly($thread);
         try {
@@ -141,6 +322,9 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function take(?ThreadInterface $thread = null)
     {
+        if ($this->sharedTasks !== null) {
+            return $this->waitForSharedTask($thread);
+        }
         $this->lock->lock();
         try {
             return $this->normalizeQueueResult($thread->pop());
@@ -156,6 +340,15 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function peek()
     {
+        if ($this->sharedTasks !== null) {
+            $this->lockShared();
+            try {
+                $value = $this->sharedTasks->get((string) $this->sharedHead->get(), 'task');
+            } finally {
+                $this->lock->unlock();
+            }
+            return $value === false ? null : unserialize($value);
+        }
         $this->lock->lock();
         try {
             return ($this->count === 0) ? null : $this->itemAt($this->takeIndex);
@@ -171,6 +364,9 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function size(): int
     {
+        if ($this->sharedTasks !== null) {
+            return $this->sharedCount->get();
+        }
         $this->lock->lock();
         try {
             return $this->count;
@@ -188,6 +384,22 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function remove($o = null)
     {
+        if ($this->sharedTasks !== null) {
+            $serialized = serialize($o);
+            $this->lockShared();
+            try {
+                $values = $this->sharedValues();
+                foreach ($values as $i => $value) {
+                    if ($value === $serialized) {
+                        $this->removeSharedAt($values, $i);
+                        return true;
+                    }
+                }
+                return false;
+            } finally {
+                $this->lock->unlock();
+            }
+        }
         $this->lock->lock();
         try {
             if ($o === null) {
@@ -237,6 +449,15 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function contains($o): bool
     {
+        if ($this->sharedTasks !== null) {
+            $serialized = serialize($o);
+            $this->lockShared();
+            try {
+                return in_array($serialized, $this->sharedValues(), true);
+            } finally {
+                $this->lock->unlock();
+            }
+        }
         $this->lock->lock();
         try {
             if ($o === null) {
@@ -261,6 +482,19 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function toArray(array &$c = null): array
     {
+        if ($this->sharedTasks !== null) {
+            $this->lockShared();
+            try {
+                $values = $this->sharedValues();
+            } finally {
+                $this->lock->unlock();
+            }
+            $result = array_map('unserialize', $values);
+            if ($c !== null) {
+                $c = $result;
+            }
+            return $result;
+        }
         $this->lock->lock();
         try {
             if ($c === null) {
@@ -286,6 +520,16 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
      */
     public function clear(): void
     {
+        if ($this->sharedTasks !== null) {
+            $this->lockShared();
+            try {
+                while ($this->sharedRemove() !== null) {
+                }
+            } finally {
+                $this->lock->unlock();
+            }
+            return;
+        }
         $this->lock->lock();
         try {
             for ($i = $this->takeIndex, $k = $this->count; $k > 0; $i = $this->inc($i), $k -= 1) {
@@ -304,6 +548,18 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
         self::checkNotNull($c);
         if ($c === $this) {
             throw new \Exception("Argument must be non-null");
+        }
+        if ($this->sharedTasks !== null) {
+            $this->lockShared();
+            try {
+                $n = min($this->sharedCount->get(), $maxElements);
+                for ($i = 0; $i < $n; ++$i) {
+                    $c[] = unserialize($this->sharedRemove());
+                }
+                return $n;
+            } finally {
+                $this->lock->unlock();
+            }
         }
         $this->lock->trylock();
         try {
@@ -332,6 +588,9 @@ class ArrayBlockingQueue extends AbstractQueue implements BlockingQueueInterface
 
     public function iterator()
     {
+        if ($this->sharedTasks !== null) {
+            return new \ArrayIterator($this->toArray());
+        }
         return new Itr($this);
     }
 }

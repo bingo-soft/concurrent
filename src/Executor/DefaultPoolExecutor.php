@@ -359,6 +359,7 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
      */
     protected function reject(RunnableInterface $command): void
     {
+        throw new \RuntimeException('Worker queue is full or executor is unavailable');
     }
 
     /**
@@ -739,6 +740,9 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
         $this->maximumPoolSize = $maximumPoolSize;
 
         $this->workQueue = $workQueue ?? new ArrayBlockingQueue();
+        if ($workerType === 'process' && $this->workQueue instanceof ArrayBlockingQueue) {
+            $this->workQueue->enableProcessSharing();
+        }
         $this->keepAliveTime = TimeUnit::toNanos($keepAliveTime, $unit);
         $this->workerType = $workerType;
          
@@ -800,10 +804,25 @@ class DefaultPoolExecutor implements ExecutorServiceInterface
             }
             $c = $this->ctl->get();
         }
-        if (self::isRunning($c) && $this->workQueue->offer($command)) {
+        $queuedId = null;
+        $queued = false;
+        if (self::isRunning($c)) {
+            if ($this->workQueue instanceof ArrayBlockingQueue && $this->workQueue->isProcessShared()) {
+                $queuedId = $this->workQueue->offerWithId($command);
+                $queued = $queuedId !== null;
+            } else {
+                $queued = $this->workQueue->offer($command);
+            }
+        }
+        if ($queued) {
             $recheck = $this->ctl->get();
-            if (!self::isRunning($recheck) && $this->remove($command)) {
-                $this->reject($command);
+            if (!self::isRunning($recheck)) {
+                $removed = $queuedId !== null
+                    ? $this->workQueue->removeById($queuedId)
+                    : $this->remove($command);
+                if ($removed) {
+                    $this->reject($command);
+                }
             } elseif (self::workerCountOf($recheck) === 0) {
                 $this->addWorker(null, false);
             }

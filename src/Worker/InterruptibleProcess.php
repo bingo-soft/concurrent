@@ -12,10 +12,23 @@ class InterruptibleProcess extends \Swoole\Process implements ThreadInterface
 {
     private $interrupted = false;
     private $closed = false;
+    private ?\Swoole\Atomic\Long $sharedInterrupted = null;
+    private bool $hasQueue = true;
+
+    public function enableSharedInterrupt(): void
+    {
+        $this->sharedInterrupted = new \Swoole\Atomic\Long(0);
+    }
+
+    public function disableQueueCleanup(): void
+    {
+        $this->hasQueue = false;
+    }
 
     public function interrupt(): void
     {
         $this->interrupted = true;
+        $this->sharedInterrupted?->set(1);
         $this->cleanup();
     }
 
@@ -24,7 +37,9 @@ class InterruptibleProcess extends \Swoole\Process implements ThreadInterface
         if (!$this->closed) {
             $this->closed = true;
             try {
-                $this->freeQueue();
+                if ($this->hasQueue) {
+                    $this->freeQueue();
+                }
             } finally {
                 $this->close();
             }
@@ -33,7 +48,7 @@ class InterruptibleProcess extends \Swoole\Process implements ThreadInterface
 
     public function isInterrupted(): bool
     {
-        return $this->interrupted;
+        return $this->interrupted || ($this->sharedInterrupted?->get() === 1);
     }
 
     public function getId(): int
