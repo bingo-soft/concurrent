@@ -32,9 +32,15 @@ class ProcessWorker extends AbstractQueuedSynchronizer implements RunnableInterf
         $this->thread = new InterruptibleProcess(function ($process) use ($scope, $args) {
             $scope->run($process, ...$args);
         }, false);
-        // IPC_PRIVATE gives every worker its own queue. A shared key makes a
-        // failed worker capable of filling or removing the queue of the pool.
-        $this->thread->useQueue(0, 2);
+        $this->thread->enableSharedInterrupt();
+        if (!(method_exists($executor, 'getQueue')
+            && $executor->getQueue() instanceof \Concurrent\Queue\ArrayBlockingQueue
+            && $executor->getQueue()->isProcessShared())) {
+            // Non-shared queue implementations still rely on the worker IPC.
+            $this->thread->useQueue(0, 2);
+        } else {
+            $this->thread->disableQueueCleanup();
+        }
     }
 
     public function start(): void
